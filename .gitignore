@@ -30,3 +30,5 @@ build/
 *.swp
 .DS_Store
 Thumbs.db
+*.session.bak-*
+*.session.*

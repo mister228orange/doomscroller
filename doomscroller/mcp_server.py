@@ -1,8 +1,25 @@
-"""MCP interface — read-only tools over the archived messages.
+"""MCP interface — the archive, the scores, and (opt-in) live Telegram.
 
-Deliberately read-only: no send tool, no ingest-triggering tool. Ingest belongs to the
-service that owns the Telegram session, so the MCP process never touches the session file
-and never contends for it.
+The server is normally used from *outside* compose: a client such as DSH, Claude Code or
+Cursor starts it over stdio on whatever machine the agent runs on. Three families of
+tools, with different requirements:
+
+* **Archive read (PostgreSQL only)** — ``read_messages``, ``new_messages``,
+  ``search_messages``, ``message_events``, ``list_picked_chats``, ``archive_stats``.
+  They need ``DATABASE_URL`` and nothing else: no Telegram credentials, no session, no
+  model, no access to this repo.
+* **Scoring read (PostgreSQL only)** — ``post_scores``, ``channel_states``,
+  ``channel_events``, and the scoring block of ``connector_status``. The scorer service
+  writes those rows; this process only reads them, and reports the models/prompt versions
+  actually recorded in the database rather than its own environment.
+* **Live Telegram (needs credentials + its own session)** — ``list_chats`` and
+  ``send_message``. The client is opened lazily on first use, with a separate session file
+  (``TELEGRAM_MCP_SESSION``, default ``<session>_mcp``) so this process never contends with
+  the poller for the same SQLite session. Sending is denied by default and requires
+  ``SEND_ALLOWLIST``; it acts as the real user account, not a bot.
+
+Ingest is deliberately not exposed: storing messages belongs to the service that owns the
+poller's session, and the cursor is committed there.
 
 Tool names are identical across every client (DSH, Claude Code, Cursor): a stdio server
 like this one is understood by all of them.
@@ -22,7 +39,7 @@ from sqlmodel import Session, select
 
 from . import __version__
 from .db import healthcheck, session_scope
-from .models import Message, Subscription
+from .models import ChannelEvent, ChannelState, Message, PostScore, Subscription
 from .store import (
     events_for_message,
     fetch_messages,
@@ -30,6 +47,7 @@ from .store import (
     search_messages as store_search,
     stats as store_stats,
 )
+from .scoring.state import pending_counts, state_snapshot
 from .subscriptions import get_subscription, list_subscriptions, normalise_ref
 
 logger = logging.getLogger(__name__)
@@ -86,9 +104,11 @@ mcp = MCPServer(
     name="doomscroller",
     version=__version__,
     instructions=(
-        "Read access to an archive of Telegram channels/chats stored in PostgreSQL. "
-        "Use list_picked_chats first to discover what is archived, then read_messages or "
-        "search_messages. All tools are read-only."
+        "Read access to an archive of Telegram channels/chats stored in PostgreSQL, plus "
+        "live Telegram chat listing and (allowlisted) sending. Use list_picked_chats for "
+        "the archive, list_chats for live chats, then read_messages or search_messages. "
+        "send_message acts as the real user account and is refused unless the target chat "
+        "is listed in SEND_ALLOWLIST."
     ),
 )
 
@@ -167,6 +187,28 @@ def connector_status() -> str:
             "stale_or_failing": stale,
         }
         report["counts"] = store_stats(session)
+        # Scoring facts come from the database, never from this process's environment: the
+        # MCP server is not the scorer and usually runs on a different machine, where
+        # SCORER_* is not set (and where the only thing that must be configured is the DB).
+        scored = session.exec(select(PostScore).where(PostScore.status == "scored")).all()
+        channels = session.exec(select(ChannelState)).all()
+        stamps = [row.scored_at for row in scored if row.scored_at is not None]
+        report["scoring"] = {
+            "channels": len(channels),
+            "scored_posts": len(scored),
+            "skipped_posts": len(
+                session.exec(select(PostScore).where(PostScore.status == "skipped")).all()
+            ),
+            "failed_posts": len(
+                session.exec(select(PostScore).where(PostScore.status == "failed")).all()
+            ),
+            "pending_posts": sum(pending_counts(session).values()),
+            "models_in_use": sorted({row.model for row in scored if row.model}),
+            "prompt_versions": sorted(
+                {row.prompt_version for row in scored if row.prompt_version}
+            ),
+            "last_scored_at": max(stamps).isoformat() if stamps else None,
+        }
     return _json(report)
 
 
@@ -235,12 +277,175 @@ def message_events(chat: str, message_id: int) -> str:
         })
 
 
+_telegram: Any = None
+
+
+async def _telegram_client() -> Any:
+    """Lazily open Telegram using the MCP's OWN session file.
+
+    A separate session keeps this process from contending with the poller over the same
+    SQLite session file.
+    """
+    global _telegram
+    if _telegram is None:
+        from .config import load_settings
+        from .telegram_client import build_client, ensure_connected
+
+        settings = load_settings()
+        client = build_client(settings, settings.mcp_session_path)
+        await ensure_connected(client, settings)
+        _telegram = client
+    return _telegram
+
+
+@mcp.tool()
+async def list_chats(limit: int = 200) -> str:
+    """List the Telegram chats/channels this account can see, most recent first.
+
+    Use this to discover a chat reference for read_messages or send_message.
+    Returns chat_id, title, username, kind, unread count.
+    """
+    from .telegram_ops import list_chats as _list_chats
+
+    limit = max(1, min(int(limit), 1000))
+    client = await _telegram_client()
+    return _json(await _list_chats(client, limit=limit))
+
+
+@mcp.tool()
+async def send_message(chat: str, text: str) -> str:
+    """Send a text message to a chat. REFUSED unless the chat is in SEND_ALLOWLIST.
+
+    This sends as the real user account, not a bot, so it is denied by default and
+    rate-limited. `chat` accepts @username, a t.me link, a numeric id, or a title.
+    """
+    from .config import load_settings
+    from .telegram_ops import SendNotAllowed, send_text
+
+    settings = load_settings()
+    try:
+        client = await _telegram_client()
+        result = await send_text(client, settings, chat, text)
+    except SendNotAllowed as exc:
+        # Return the reason rather than raising: the MCP SDK replaces a raised
+        # exception with a generic "Error executing tool", which hides why it failed.
+        return _json({"sent": False, "refused": True, "reason": str(exc)})
+    return _json({"sent": True, **result})
+
+
 @mcp.tool()
 def archive_stats() -> str:
     """Row counts per table (subscriptions, messages, events, deleted)."""
     _ensure_db()
     with session_scope() as session:
         return _json(store_stats(session))
+
+
+
+# ── scoring (read-only: the scorer service writes, MCP only reads) ────────────
+
+def _score(m: PostScore) -> dict:
+    return {
+        "message_id": m.message_id,
+        "status": m.status,
+        "date": m.message_date.isoformat() if m.message_date else None,
+        "title": m.title,
+        "genre": m.genre,
+        "primary": m.primary,
+        "secondary": m.secondary,
+        "thesis": m.main_thesis,
+        "scores": {
+            axis: getattr(m, f"score_{axis.lower()}")
+            for axis in ("I", "V", "U", "P", "S", "D")
+        },
+        "kpd": m.kpd,
+        "eff": m.eff,
+        "density_type": m.density_type,
+        "flags": m.flags,
+        "deviation": m.deviation,
+        "trend_position": m.trend_position,
+        "shift_candidate": m.shift_candidate,
+        "confidence": m.confidence,
+        "nearest_anchors": m.nearest_anchors,
+        "selfcheck": m.selfcheck,
+        "attempts": m.attempts,
+        "detail": m.detail,
+        "model": m.model,
+        "prompt_version": m.prompt_version,
+        "scored_at": m.scored_at.isoformat() if m.scored_at else None,
+    }
+
+
+@mcp.tool()
+def post_scores(chat: str, limit: int = 20, include_skipped: bool = False) -> str:
+    """Rubric scores stored for a chat, newest first.
+
+    Each row is the six axes, KPD/Eff, the classification, and the channel-relative
+    view (deviation from the trend, position, shift candidate).
+    """
+    _ensure_db()
+    limit = max(1, min(int(limit), 500))
+    with session_scope() as session:
+        chat_id = _chat_id(session, chat)
+        stmt = select(PostScore).where(PostScore.chat_id == chat_id)
+        if not include_skipped:
+            stmt = stmt.where(PostScore.status == "scored")
+        rows = list(session.exec(stmt.order_by(PostScore.message_id.desc()).limit(limit)).all())
+        return _json({"chat": chat, "chat_id": chat_id, "count": len(rows),
+                      "scores": [_score(r) for r in rows]})
+
+
+@mcp.tool()
+def channel_states() -> str:
+    """The trajectory of every scored channel: profile, trend, summary, tags, anchors."""
+    _ensure_db()
+    with session_scope() as session:
+        states = list(
+            session.exec(select(ChannelState).order_by(ChannelState.updated_at.desc())).all()
+        )
+        pending = pending_counts(session)
+        return _json(
+            [
+                state_snapshot(
+                    session,
+                    state,
+                    context_anchors=5,
+                    events=5,
+                    pending=pending.get(int(state.chat_id), 0),
+                )
+                for state in states
+            ]
+        )
+
+
+@mcp.tool()
+def channel_events(chat: str, limit: int = 20) -> str:
+    """Append-only trajectory events for a channel (shift / peak / summary), newest first."""
+    _ensure_db()
+    limit = max(1, min(int(limit), 200))
+    with session_scope() as session:
+        chat_id = _chat_id(session, chat)
+        rows = list(
+            session.exec(
+                select(ChannelEvent)
+                .where(ChannelEvent.chat_id == chat_id)
+                .order_by(ChannelEvent.id.desc())
+                .limit(limit)
+            ).all()
+        )
+        return _json({
+            "chat": chat,
+            "count": len(rows),
+            "events": [
+                {
+                    "kind": e.kind,
+                    "at": e.created_at.isoformat() if e.created_at else None,
+                    "message_id": e.message_id,
+                    "note": e.note,
+                }
+                for e in rows
+            ],
+        })
 
 
 def run(transport: str = "stdio", **kwargs: Any) -> None:

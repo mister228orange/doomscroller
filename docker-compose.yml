@@ -5,6 +5,16 @@
 #   docker compose run --rm doomscroller init-db
 #   docker compose run --rm doomscroller subscribe @somechannel
 #   docker compose up -d      # start the poller
+#   docker compose up -d scorer   # optional: the scoring agent (needs SCORER_* in .env)
+#
+# Three roles, three containers, deliberately separated:
+#   db            — storage
+#   doomscroller  — the Telegram session + ingest (the only holder of the login)
+#   scorer        — PostgreSQL + LLM; no Telegram credentials at all
+#
+# The MCP server is NOT a compose service: it is a client-side process (stdio), usually
+# started on the host by the agent that uses it. It needs DATABASE_URL, and Telegram
+# variables only for its live tools (list_chats / send_message).
 #
 # Postgres is published on 5434 (not 5432) so it cannot collide with other stacks.
 
@@ -48,6 +58,49 @@ services:
     volumes:
       - .:/app
     command: ["python", "-m", "doomscroller", "poll", "--loop"]
+
+  # The scoring agent — a DIFFERENT container with a DIFFERENT job from the poller.
+  #
+  #   poller (`doomscroller`): Telegram session, ingest, no model.
+  #   scorer (this service):   PostgreSQL + a model, NO Telegram at all.
+  #
+  # That is why it takes no `env_file`: Telegram credentials, the session and
+  # SEND_ALLOWLIST have no business inside a container that only reads the archive. Only
+  # the SCORER_* knobs pass through, interpolated from .env by compose itself.
+  scorer:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-doomscroller}:${POSTGRES_PASSWORD:-doomscroller}@db:5432/${POSTGRES_DB:-doomscroller}
+      SCORER_RUBRIC_DIR: /app/scoring
+      SCORER_BASE_URL: ${SCORER_BASE_URL:-}
+      SCORER_API_KEY: ${SCORER_API_KEY:-}
+      # Alternative key name: the provider calls it NANOGPT_API_KEY.
+      NANOGPT_API_KEY: ${NANOGPT_API_KEY:-}
+      SCORER_MODEL: ${SCORER_MODEL:-}
+      SCORER_TEMPERATURE: ${SCORER_TEMPERATURE:-0}
+      SCORER_TIMEOUT: ${SCORER_TIMEOUT:-600}
+      SCORER_RETRIES: ${SCORER_RETRIES:-2}
+      SCORER_JSON_MODE: ${SCORER_JSON_MODE:-auto}
+      SCORER_MAX_TOKENS: ${SCORER_MAX_TOKENS:-0}
+      SCORER_MIN_CHARS: ${SCORER_MIN_CHARS:-120}
+      SCORER_MAX_CHARS: ${SCORER_MAX_CHARS:-12000}
+      SCORER_MAX_POSTS_PER_RUN: ${SCORER_MAX_POSTS_PER_RUN:-20}
+      SCORER_MAX_ATTEMPTS: ${SCORER_MAX_ATTEMPTS:-3}
+      SCORER_SUMMARY_EVERY: ${SCORER_SUMMARY_EVERY:-5}
+      SCORER_WINDOW: ${SCORER_WINDOW:-5}
+      SCORER_INTERVAL: ${SCORER_INTERVAL:-900}
+      SCORER_GENRE: ${SCORER_GENRE:-}
+    working_dir: /app
+    volumes:
+      # Only the rubric is mounted: rule files stay editable on the host (a methodology
+      # should be tunable without a rebuild), while the Telethon session in the repo root
+      # is not visible to this container at all.
+      - ./scoring:/app/scoring:ro
+    command: ["python", "-m", "doomscroller", "score", "--loop"]
 
   adminer:
     image: adminer

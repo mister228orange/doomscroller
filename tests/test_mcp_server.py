@@ -16,6 +16,7 @@ import pytest
 from mcp import Client, StdioServerParameters
 
 from doomscroller.mcp_server import mcp
+from doomscroller.models import PostScore
 from doomscroller.store import record_event
 from doomscroller.subscriptions import subscribe
 
@@ -29,6 +30,11 @@ EXPECTED_TOOLS = {
     "search_messages",
     "message_events",
     "archive_stats",
+    "list_chats",
+    "send_message",
+    "post_scores",
+    "channel_states",
+    "channel_events",
 }
 
 
@@ -156,3 +162,78 @@ async def test_stdio_subprocess_speaks_mcp(session):
             _text(await client.call_tool("list_picked_chats", {}))
         )
     assert payload[0]["chat"] == "seedchat"
+
+
+# ── scoring surface ──────────────────────────────────────────────────────────
+
+def _seed_scores(session):
+    from doomscroller.scoring.state import apply_score, get_or_create_state
+
+    state = get_or_create_state(session, chat_id=-1005550001111, chat_ref="seedchat")
+    for index, (kpd_i, primary) in enumerate([(8.0, "SCI"), (4.0, "TECH")], start=1):
+        row = PostScore(
+            chat_id=-1005550001111,
+            message_id=index,
+            status="scored",
+            primary=primary,
+            secondary=["TRUST"],
+            main_thesis=f"тезис {index}",
+            score_i=kpd_i,
+            score_v=kpd_i,
+            score_u=kpd_i,
+            score_p=5.0,
+            score_s=5.0,
+            score_d=kpd_i,
+            kpd=kpd_i,
+            eff=kpd_i / 5.0,
+            confidence="medium",
+        )
+        apply_score(session, state, row)
+    session.commit()
+
+
+async def test_post_scores_tool_returns_the_rubric_rows(session):
+    _seed(session)
+    _seed_scores(session)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool("post_scores", {"chat": "seedchat"})))
+    assert payload["count"] == 2
+    newest = payload["scores"][0]
+    assert newest["message_id"] == 2
+    assert newest["scores"]["I"] == 4.0
+    assert newest["kpd"] == 4.0
+    assert newest["deviation"] is not None
+    assert newest["trend_position"] in {"above", "at", "below"}
+
+
+async def test_channel_states_tool_returns_the_trajectory(session):
+    _seed(session)
+    _seed_scores(session)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool("channel_states", {})))
+    assert len(payload) == 1
+    state = payload[0]
+    assert state["total_scored"] == 2
+    assert state["means"]["I"] == 7.2  # (8*4 + 4) / 5
+    assert state["tag_distribution"] == {"SCI": 1, "TECH": 1}
+    assert len(state["local_anchors"]) == 2
+
+
+async def test_channel_events_tool_returns_the_append_only_log(session):
+    _seed(session)
+    _seed_scores(session)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool("channel_events", {"chat": "seedchat"})))
+    # the first post set a new channel best, which apply_score logged as a peak
+    assert payload["count"] == 1
+    assert payload["events"][0]["kind"] == "peak"
+    assert payload["events"][0]["message_id"] == 1
+
+
+async def test_connector_status_reports_scoring_readiness(session):
+    _seed(session)
+    _seed_scores(session)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool("connector_status", {})))
+    assert payload["scoring"]["scored_posts"] == 2
+    assert payload["scoring"]["channels"] == 1

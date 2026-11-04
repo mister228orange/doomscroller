@@ -8,6 +8,8 @@ WORKDIR /app
 # Install the package first so dependency layers cache independently of source edits.
 COPY pyproject.toml README.md ./
 COPY doomscroller ./doomscroller
+# The scoring rubric is data, not code: the agent reads these markdown modules at runtime.
+COPY scoring ./scoring
 RUN pip install --no-cache-dir .
 
 # The repo is bind-mounted at /app by compose (so .env and the Telethon session are

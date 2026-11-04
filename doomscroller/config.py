@@ -35,6 +35,16 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number, got {raw!r}") from exc
+
+
 def _csv(name: str) -> list[str]:
     return [p.strip() for p in _env(name).split(",") if p.strip()]
 
@@ -121,11 +131,35 @@ class Settings:
     subscriptions: list[str] = field(default_factory=list)
     poll_interval: int = 15
     batch_size: int = 100
+    # Outbound sending is DENIED unless a chat is explicitly allowlisted here.
+    # "*" allows every chat (a deliberate opt-in). Sending acts as a real user
+    # account, which Telegram rate-limits and can ban, so it is off by default.
+    send_allowlist: list[str] = field(default_factory=list)
+    send_rate_per_min: int = 20
+    mcp_session_name: str = ""
 
     @property
     def session_path(self) -> Path:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         return self.data_dir / self.session_name
+
+    @property
+    def mcp_session_path(self) -> Path:
+        """The MCP server's own session file, so it never contends with the poller."""
+        name = self.mcp_session_name or f"{self.session_name}_mcp"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        return self.data_dir / name
+
+    def send_allowed(self, chat_ref: str) -> bool:
+        """True only if this chat is explicitly allowlisted for outbound sends."""
+        if not self.send_allowlist:
+            return False
+        if "*" in self.send_allowlist:
+            return True
+        from .subscriptions import normalise_ref
+
+        target = normalise_ref(chat_ref).lower()
+        return any(normalise_ref(a).lower() == target for a in self.send_allowlist)
 
 
 def load_settings() -> Settings:
@@ -153,4 +187,82 @@ def load_settings() -> Settings:
         subscriptions=_csv("SUBSCRIPTIONS"),
         poll_interval=_env_int("POLL_INTERVAL", 15),
         batch_size=_env_int("BATCH_SIZE", 100),
+        send_allowlist=_csv("SEND_ALLOWLIST"),
+        send_rate_per_min=_env_int("SEND_RATE_PER_MIN", 20),
+        mcp_session_name=_env("TELEGRAM_MCP_SESSION"),
+    )
+
+
+# ── scoring agent ─────────────────────────────────────────────────────────────
+
+#: NanoGPT's OpenAI-compatible endpoint. The scorer's default backend: DeepSeek models,
+#: one key, a dollar-based balance instead of a local GPU.
+NANOGPT_BASE_URL = "https://nano-gpt.com/api/v1"
+
+#: The original DeepSeek model: `deepseek-chat` is DeepSeek's own V3 (NanoGPT describes it
+#: as "DeepSeek original V3 model"), not a derivative, an abliterated fork or a TEE re-host.
+#: A pinned id, not a `-latest` alias: a score row stores the model that produced it, and two
+#: runs of the same rubric should differ only because the text differs.
+DEFAULT_SCORER_MODEL = "deepseek-chat"
+
+@dataclass
+class ScorerConfig:
+    """Everything the scoring agent needs.
+
+    Deliberately independent of :class:`Settings`: the scorer reads PostgreSQL and calls
+    an LLM, so it must be runnable without Telegram credentials at all.
+    """
+
+    rubric_dir: Path = field(default_factory=lambda: BASE_DIR / "scoring")
+    #: NanoGPT by default — DeepSeek behind an OpenAI-compatible path.
+    base_url: str = NANOGPT_BASE_URL
+    api_key: str = ""
+    model: str = DEFAULT_SCORER_MODEL
+    temperature: float = 0.0
+    timeout: float = 600.0
+    retries: int = 2
+    #: auto | on | off — whether to ask the backend for a JSON response format.
+    json_mode: str = "auto"
+    max_tokens: int = 0
+    #: Posts shorter than this are archived but not rubric material — they are recorded
+    #: as `skipped` so a one-word post cannot be scored as if it were an essay.
+    min_chars: int = 120
+    #: Cap on how much of one post is sent; a 100k-char post would bury the rubric.
+    max_chars: int = 12000
+    #: How many posts one run may score, per the whole run (backfill spans runs).
+    max_posts_per_run: int = 20
+    #: Retries for posts whose scoring failed.
+    max_attempts: int = 3
+    #: Rebuild the channel memory every N new posts; 0 disables the extra call.
+    summary_every: int = 5
+    #: EWMA window of the channel trend.
+    window: int = 5
+    #: Seconds between scheduler ticks when running with --loop.
+    interval: int = 900
+    #: Optional fixed genre for every post of this run.
+    genre: str = ""
+
+
+def load_scorer_config() -> ScorerConfig:
+    rubric_dir = Path(_env("SCORER_RUBRIC_DIR") or BASE_DIR / "scoring").expanduser()
+    return ScorerConfig(
+        rubric_dir=rubric_dir,
+        base_url=_env("SCORER_BASE_URL") or NANOGPT_BASE_URL,
+        # NANOGPT_API_KEY is accepted too: it is the name the provider itself uses, so an
+        # existing key does not have to be copied under a second name.
+        api_key=_env("SCORER_API_KEY") or _env("NANOGPT_API_KEY"),
+        model=_env("SCORER_MODEL") or DEFAULT_SCORER_MODEL,
+        temperature=_env_float("SCORER_TEMPERATURE", 0.0),
+        timeout=_env_float("SCORER_TIMEOUT", 600.0),
+        retries=_env_int("SCORER_RETRIES", 2),
+        json_mode=(_env("SCORER_JSON_MODE", "auto") or "auto").lower(),
+        max_tokens=_env_int("SCORER_MAX_TOKENS", 0),
+        min_chars=_env_int("SCORER_MIN_CHARS", 120),
+        max_chars=_env_int("SCORER_MAX_CHARS", 12000),
+        max_posts_per_run=_env_int("SCORER_MAX_POSTS_PER_RUN", 20),
+        max_attempts=_env_int("SCORER_MAX_ATTEMPTS", 3),
+        summary_every=_env_int("SCORER_SUMMARY_EVERY", 5),
+        window=_env_int("SCORER_WINDOW", 5),
+        interval=_env_int("SCORER_INTERVAL", 900),
+        genre=_env("SCORER_GENRE"),
     )

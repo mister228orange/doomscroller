@@ -6,7 +6,7 @@ import os
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlmodel import Session, SQLModel, create_engine
 
 _engine = None
@@ -59,10 +59,7 @@ def healthcheck(url: str | None = None) -> dict:
     engine = get_engine(url)
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
-        row = conn.execute(
-            text(
-                "SELECT count(*) FROM information_schema.tables "
-                "WHERE table_schema = current_schema()"
-            )
-        ).scalar()
-    return {"ok": True, "tables": int(row or 0)}
+        # Inspector rather than information_schema: the same check has to work on
+        # PostgreSQL (production) and on the SQLite file the test suite falls back to.
+        tables = inspect(conn).get_table_names()
+    return {"ok": True, "tables": len(tables)}

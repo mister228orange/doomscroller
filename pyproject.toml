@@ -1,6 +1,6 @@
 [project]
 name = "doomscroller"
-version = "0.2.0"
+version = "0.3.0"
 description = "Telegram subscription archiver: subscribe to chats/channels, store every event in PostgreSQL, query any amount of history or just what's new."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "ollama>=0.6.2",
     "mcp>=2.3.0",
+    "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["doomscroller"]
+# The rubric is data the agent reads at runtime. Ship it inside the wheel so a plain
+# `pip install doomscroller` can score on any machine, not only inside the compose checkout.
+force-include = { "scoring" = "doomscroller/rubric" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -12,11 +12,16 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 
-def build_client(settings: Settings) -> TelegramClient:
+def build_client(settings: Settings, session_path: Any | None = None) -> TelegramClient:
+    """Build a Telethon client.
+
+    ``session_path`` lets the MCP server use its own session file so it never contends
+    with the poller for the same SQLite session.
+    """
     kwargs: dict[str, Any] = settings.proxy.telethon_kwargs()
     logger.info("Telegram connecting via %s", settings.proxy.describe())
     return TelegramClient(
-        str(settings.session_path),
+        str(session_path or settings.session_path),
         settings.api_id,
         settings.api_hash,
         **kwargs,
