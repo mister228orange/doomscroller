@@ -5,3 +5,28 @@ doom_states/
 .venv/
 __pycache__/
 *.py[cod]
+# Secrets & local data — never commit
+.env.*
+!.env.example
+*.db
+*.db-journal
+data/
+# Python
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+# IDE / OS
+.idea/
+.vscode/
+.cursor/
+*.swp
+.DS_Store
+Thumbs.db

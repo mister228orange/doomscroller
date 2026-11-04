@@ -1,0 +1,61 @@
+# doomscroller — Telegram subscription archiver.
+#
+#   cp .env.example .env      # fill TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_PHONE
+#   docker compose up -d db   # start postgres first
+#   docker compose run --rm doomscroller init-db
+#   docker compose run --rm doomscroller subscribe @somechannel
+#   docker compose up -d      # start the poller
+#
+# Postgres is published on 5434 (not 5432) so it cannot collide with other stacks.
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-doomscroller}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-doomscroller}
+      POSTGRES_DB: ${POSTGRES_DB:-doomscroller}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      # postgres:18+ wants a single mount at /var/lib/postgresql (it creates a
+      # major-version subdirectory); mounting .../data makes the container exit.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-doomscroller} -d ${POSTGRES_DB:-doomscroller}
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  doomscroller:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Overrides .env: inside the compose network the database is `db`, not 127.0.0.1.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-doomscroller}:${POSTGRES_PASSWORD:-doomscroller}@db:5432/${POSTGRES_DB:-doomscroller}
+      # Keep the Telethon session next to the repo so an existing login is reused.
+      DATA_DIR: /app
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: ["python", "-m", "doomscroller", "poll", "--loop"]
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "127.0.0.1:${ADMINER_PORT:-8082}:8080"
+
+volumes:
+  pgdata:

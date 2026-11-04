@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.session
+*.session-journal
+.env
+doom_states
+data
+.pytest_cache
