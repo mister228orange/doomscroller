@@ -132,18 +132,19 @@ The session file lives at `$DATA_DIR/$TELEGRAM_SESSION.session`. Compose mounts 
 `/app` with `DATA_DIR=/app`, so an existing `scroller_session.session` at the repo root is
 reused as-is.
 
-## MCP: use the archive from an AI agent
+## MCP: use the archive from an agent
 
-doomscroller serves the archive, the scores and — if you ask for it — live Telegram over
-[MCP](https://modelcontextprotocol.io). This normally runs **outside compose**: the client
-starts it over stdio on the machine the agent runs on.
+The archive, the scores, and (if you allow it) live Telegram are served over
+[MCP](https://modelcontextprotocol.io). This normally runs **outside compose**: the agent
+client starts the server over stdio on whatever machine the agent runs on.
 
 ```bash
-python -m doomscroller mcp                                              # stdio (local clients)
-python -m doomscroller mcp --transport streamable-http --port 8765      # HTTP (remote clients)
+python -m doomscroller mcp                                            # stdio: one process per client
+python -m doomscroller mcp --transport streamable-http --port 8765    # HTTP: many clients, one server
 ```
 
-Three families of tools, with different requirements:
+Three families of tools, with different requirements — this is the only thing you have to
+get right when wiring a new client:
 
 | Tools | Needs | Notes |
 |---|---|---|
@@ -151,19 +152,46 @@ Three families of tools, with different requirements:
 | `post_scores`, `channel_states`, `channel_events`, `connector_status` | `DATABASE_URL` | the scorer writes those rows; MCP only reads them, and reports the models + prompt versions actually recorded in the database |
 | `list_chats`, `send_message` | `DATABASE_URL` + Telegram credentials + a session | client opened lazily, on first use only |
 
-`send_message` acts as the **real user account**, so it is denied by default: a chat must be
-listed in `SEND_ALLOWLIST` (or `*`), and sends are rate-limited by `SEND_RATE_PER_MIN`.
-`list_chats` and `send_message` open their **own** session file
-(`TELEGRAM_MCP_SESSION`, default `<session>_mcp`) — that is what keeps the MCP process from
-contending with the poller over the same SQLite session. The first use of a live tool
-performs the usual interactive login for that file.
+A client that only wants the archive and the scores needs **no Telegram configuration at
+all**. `send_message` acts as the real user account, so it is denied by default: a chat must
+be listed in `SEND_ALLOWLIST` (or `*`), and sends are rate-limited by `SEND_RATE_PER_MIN`.
 
-Ingest is deliberately not exposed: the cursor belongs to the poller.
+Two environment traps, both learned the hard way:
+
+1. **`.env` holds the compose hostname.** `DATABASE_URL` in `.env` is
+   `...@db:5432/doomscroller`, which only resolves inside the compose network. An agent
+   running on the host must receive `...@127.0.0.1:5434/doomscroller` explicitly — the
+   server reads `.env` with `override=False`, so an explicit variable wins.
+2. **One live session per process.** `list_chats` and `send_message` open their own session
+   file (`TELEGRAM_MCP_SESSION`, default `<session>_mcp`) so they never contend with the
+   poller. If several MCP processes may use the live tools at once, give each one a distinct
+   `TELEGRAM_MCP_SESSION` — two processes sharing one SQLite session file is a locking race.
+
+### Where each client keeps its config
+
+| Client | Config location | Add command | Verify |
+|---|---|---|---|
+| DeepSeek Harness | `~/.dsh/profiles/<profile>/cordis.patch.yml` | edit the patch (see below) | tools named `mcp__doomscroller__*` |
+| Claude Code | `claude mcp list`, scopes `local`/`project`/`user` | `claude mcp add` | `claude mcp list` |
+| Codex CLI | `~/.codex/config.toml` | `codex mcp add` | `codex mcp list` |
+| Cursor | `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` | edit the file | `cursor-agent mcp list`, `cursor-agent mcp list-tools doomscroller` |
+| Gemini CLI | `~/.gemini/settings.json` | `gemini mcp add` | `gemini mcp list` |
+| VS Code (Copilot agent mode) | `.vscode/mcp.json` (project) or user profile | edit the file | MCP servers panel / tool picker |
+| Anything else | its own `mcpServers` map | — | call `connector_status` |
+
+Substitute `<repo>` with the checkout path and `<db-url>` with a PostgreSQL URL the client
+machine can actually reach (`postgresql+psycopg://doomscroller:doomscroller@127.0.0.1:5434/doomscroller`
+for the compose database, published on port 5434).
+
+`<repo>/.venv/bin/python` works from any directory because the package is installed editable
+(`uv pip install -e .`). If you point a client at a plain system Python instead, either install
+it there too or pass `PYTHONPATH=<repo>` — otherwise `python -m doomscroller` will not find the
+package, and the client will report a server that starts and then immediately dies.
 
 ### DeepSeek Harness (DSH)
 
-Add to `~/.dsh/profiles/web/cordis.patch.yml` (a top-level YAML array), replacing `<repo>`
-with the checkout path:
+DSH mounts plugins from the profile's patch layer. Add one entry — the row id is what makes
+it addressable, so keep it stable:
 
 ```yaml
 - id: mcp-doomscroller
@@ -175,27 +203,59 @@ with the checkout path:
     args: ['-m', 'doomscroller', 'mcp', '--transport', 'stdio']
     cwd: <repo>
     env:
-      DATABASE_URL: postgresql+psycopg://doomscroller:doomscroller@127.0.0.1:5434/doomscroller
+      DATABASE_URL: <db-url>
       DATA_DIR: <repo>
-      # Only for the live tools; omit all four and you still get the archive + the scores.
-      # TELEGRAM_API_ID: ...
-      # TELEGRAM_API_HASH: ...
-      # TELEGRAM_PHONE: ...
-      # TELEGRAM_MCP_SESSION: scroller_session_mcp
-      # SEND_ALLOWLIST: '@somechat'      # sending is off unless you list a chat here
+    failOnStartupError: false
+    toolCallTimeoutMs: 30000
 ```
 
-Note the host port `5434`: the MCP process talks to Postgres directly and does not go
-through compose. `DATA_DIR` is only needed for the live tools (the session file lives
-there).
-
-The tools appear as `mcp__doomscroller__read_messages`, `mcp__doomscroller__post_scores`,
-and so on. The profile has `patchReload: live`, so saving the file hot-reloads — no restart.
+The file sits at `~/.dsh/profiles/web/cordis.patch.yml` (a top-level YAML array). This is a
+live profile: changes made through `plugin_manager` apply immediately, and after a hand edit
+the `mcp__doomscroller__*` tools appear without a full restart. Confirm by asking the agent to
+call `connector_status` — it reports the database, the session file and the scoring state.
 `failOnStartupError: false` keeps a broken database from blocking the whole session.
 
-### Claude Code, Cursor, Codex, or any other MCP client
+Two notes specific to this harness:
 
-Same stdio command, their own config file:
+- **Register it once.** A row inserted by a bundle and a row in the patch file that share the
+  loader id do not coexist — the later layer shadows the earlier one, and removing the
+  shadowing bundle removes the row rather than falling back. Keep a single registration.
+- Prefer `plugin_manager` (`install_bundle` with a package whose `cordis.patch.yml` inserts
+  this entry) over hand-editing the profile when you want it to survive across machines;
+  hand-editing is fine for a personal profile, and the entry above is exactly what a bundle
+  would insert.
+
+### Claude Code
+
+```bash
+claude mcp add doomscroller \
+  -e DATABASE_URL=<db-url> \
+  -s user \
+  -- <repo>/.venv/bin/python -m doomscroller mcp --transport stdio
+
+claude mcp list        # should show doomscroller as connected
+```
+
+`-s user` makes it available in every project; `-s project` writes it into the repository's
+`.mcp.json` so teammates get it with the repo. Add `-e DATA_DIR=<repo>` plus the Telegram
+variables only if you want `list_chats` / `send_message`.
+
+### Codex CLI
+
+```bash
+codex mcp add doomscroller \
+  --env DATABASE_URL=<db-url> \
+  -- <repo>/.venv/bin/python -m doomscroller mcp --transport stdio
+
+codex mcp list
+```
+
+This writes a `[mcp_servers.doomscroller]` table into `~/.codex/config.toml`; editing that
+table directly is equivalent.
+
+### Cursor
+
+`.cursor/mcp.json` in the repository (or `~/.cursor/mcp.json` for every project):
 
 ```json
 {
@@ -203,23 +263,81 @@ Same stdio command, their own config file:
     "doomscroller": {
       "command": "<repo>/.venv/bin/python",
       "args": ["-m", "doomscroller", "mcp", "--transport", "stdio"],
-      "env": { "DATABASE_URL": "postgresql+psycopg://...", "PYTHONPATH": "<repo>" }
+      "env": { "DATABASE_URL": "<db-url>" }
     }
   }
 }
 ```
 
-### Another machine, or several agents at once
+Verify from the terminal: `cursor-agent mcp list` (connection status) and
+`cursor-agent mcp list-tools doomscroller` (the twelve tool names).
 
-Run the HTTP transport once and point every client at it:
+### Gemini CLI
 
 ```bash
-python -m doomscroller mcp --transport streamable-http --host 0.0.0.0 --port 8765
-# clients connect to http://<host>:8765/mcp
+gemini mcp add doomscroller <repo>/.venv/bin/python -m doomscroller mcp --transport stdio
+gemini mcp list
 ```
 
-Put it behind TLS if it leaves localhost — the HTTP transport has no built-in
-authentication, so treat an exposed port as an open read API for your archive.
+Then put `DATABASE_URL` (and `DATA_DIR` for live tools) into the `env` block of the generated
+entry in `~/.gemini/settings.json` — the CLI adds the command, not the environment.
+
+### VS Code (Copilot agent mode)
+
+`.vscode/mcp.json` in the repository:
+
+```json
+{
+  "servers": {
+    "doomscroller": {
+      "type": "stdio",
+      "command": "<repo>/.venv/bin/python",
+      "args": ["-m", "doomscroller", "mcp", "--transport", "stdio"],
+      "env": { "DATABASE_URL": "<db-url>" }
+    }
+  }
+}
+```
+
+VS Code spells the map `servers` (not `mcpServers`) and wants an explicit `"type": "stdio"`.
+
+### One server, many agents
+
+Run the HTTP transport once and point every client at it — the useful setup when several
+agents share one machine, or when one agent runs elsewhere:
+
+```bash
+python -m doomscroller mcp --transport streamable-http --host 127.0.0.1 --port 8765
+# clients connect to http://127.0.0.1:8765/mcp
+```
+
+Then a client points at that URL instead of spawning a process — same tools, no per-client
+install:
+
+```bash
+claude mcp add --transport http doomscroller http://127.0.0.1:8765/mcp
+codex mcp add doomscroller --url http://127.0.0.1:8765/mcp
+```
+
+```yaml
+# DSH: same profile patch, different transport
+- id: mcp-doomscroller
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: doomscroller
+    transport: streamable-http
+    url: http://127.0.0.1:8765/mcp
+```
+
+The server-side environment (`DATABASE_URL`, Telegram session) then belongs to the one
+`mcp` process you started, not to each client — which is also how you avoid several agents
+racing over live Telegram sessions. Put it behind TLS if it leaves localhost — **the HTTP
+transport has no authentication**, so treat an exposed port as an open read API for your
+archive (and, with `SEND_ALLOWLIST` set, as a way to post as you). For stdio clients nothing
+is exposed: each client gets its own process.
+
+Ingest is deliberately not exposed over MCP: the cursor belongs to the poller, which is the
+only process that holds the account's ingest session.
 
 ## Scoring agent (`score`)
 
