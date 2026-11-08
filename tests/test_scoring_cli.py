@@ -188,6 +188,9 @@ def test_check_without_a_key_exits_nonzero_and_says_why(session, capsys, monkeyp
 
 def test_check_reports_a_healthy_paid_endpoint(session, capsys, monkeypatch):
     _seed(session)
+    # SCORER_API_KEY outranks NANOGPT_API_KEY, and the repo .env may carry a real
+    # one — pin the primary variable so the assertion is machine-independent.
+    monkeypatch.setenv("SCORER_API_KEY", "sk-test")
     monkeypatch.setenv("NANOGPT_API_KEY", "sk-test")
     stub = _stub_backend(monkeypatch)
     code = main(["score", "--check"])

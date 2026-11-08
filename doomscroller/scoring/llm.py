@@ -209,7 +209,40 @@ class ChatClient:
             payload["max_tokens"] = self.max_tokens
         if self.json_mode == "on" or (self.json_mode == "auto" and self._json_mode_works):
             payload["response_format"] = {"type": "json_object"}
+        return await self._send_with_retries(payload)
 
+    async def chat_raw(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        json_mode: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        """One completion with caller-built messages.
+
+        Needed for multimodal payloads (image parts), which :meth:`chat` cannot express.
+        ``json_mode`` overrides the client default: ``False`` sends no ``response_format``
+        at all, which is what free-text transcription wants.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": messages,
+            "stream": False,
+        }
+        limit = self.max_tokens if max_tokens is None else max_tokens
+        if limit:
+            payload["max_tokens"] = limit
+        if json_mode is True or (
+            json_mode is None
+            and (self.json_mode == "on" or (self.json_mode == "auto" and self._json_mode_works))
+        ):
+            payload["response_format"] = {"type": "json_object"}
+        # json_mode=False sends no response_format at all — free text.
+        return await self._send_with_retries(payload)
+
+    async def _send_with_retries(self, payload: dict[str, Any]) -> LLMResponse:
+        """Send one payload, retrying transient failures with a short backoff."""
         last_error: Optional[Exception] = None
         started = time.monotonic()
         for attempt in range(self.retries + 1):

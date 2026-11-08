@@ -55,6 +55,20 @@ def session_scope(url: str | None = None) -> Iterator[Session]:
         session.close()
 
 
+@contextmanager
+def session_factory(url: str | None = None) -> Iterator[Session]:
+    """A session whose transaction the caller owns (commits itself, closes on exit).
+
+    For passes that want one transaction per item — an interrupted OCR run keeps every
+    image it already read instead of losing the whole batch.
+    """
+    session = Session(get_engine(url), expire_on_commit=False)
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def healthcheck(url: str | None = None) -> dict:
     engine = get_engine(url)
     with engine.connect() as conn:

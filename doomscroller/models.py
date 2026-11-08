@@ -410,3 +410,52 @@ class ChannelEvent(SQLModel, table=True):
         default_factory=utcnow,
         sa_column=Column("created_at", DateTime(timezone=True), nullable=False),
     )
+
+
+class MediaOcr(SQLModel, table=True):
+    """OCR result for one media message.
+
+    The archive stays pure: ``messages.text`` is what Telegram delivered (caption), and the
+    text extracted from the image lives here, joined by ``(chat_id, message_id)``. A row with
+    ``status='no_text'`` is the "ignore it" verdict — the image was looked at, nothing was
+    readable, and it must not be re-processed on every run.
+    """
+
+    __tablename__ = "media_ocr"
+    __table_args__ = (
+        UniqueConstraint("chat_id", "message_id", name="uq_media_ocr_chat_message"),
+        Index("ix_media_ocr_chat_status", "chat_id", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chat_id: int = Field(sa_column=Column("chat_id", BigInteger, nullable=False))
+    message_id: int = Field(sa_column=Column("message_id", BigInteger, nullable=False))
+
+    status: str = Field(
+        default="ok",
+        sa_column=Column("status", String(16), nullable=False, server_default="ok", index=True),
+    )
+    ocr_text: Optional[str] = Field(default=None, sa_column=Column("ocr_text", Text, nullable=True))
+    #: Which pass produced the text: `eng`, `rus`, or `none`.
+    language: Optional[str] = Field(default=None, sa_column=Column("language", String(8), nullable=True))
+    engine: Optional[str] = Field(default=None, sa_column=Column("engine", String(24), nullable=True))
+    model: Optional[str] = Field(default=None, sa_column=Column("model", Text, nullable=True))
+    attempts: int = Field(
+        default=0, sa_column=Column("attempts", Integer, nullable=False, server_default="0")
+    )
+    detail: Optional[str] = Field(default=None, sa_column=Column("detail", Text, nullable=True))
+    prompt_tokens: Optional[int] = Field(
+        default=None, sa_column=Column("prompt_tokens", Integer, nullable=True)
+    )
+    completion_tokens: Optional[int] = Field(
+        default=None, sa_column=Column("completion_tokens", Integer, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column("created_at", DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column("updated_at", DateTime(timezone=True), nullable=False),
+    )

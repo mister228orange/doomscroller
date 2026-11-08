@@ -32,3 +32,6 @@ build/
 Thumbs.db
 *.session.bak-*
 *.session.*
+
+# generated rating pages
+reports/

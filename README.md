@@ -111,6 +111,8 @@ python -m doomscroller fetch @somechannel --limit 50
 | `scores CHAT [--limit N] [--json] [--all]` | stored rubric rows for a chat |
 | `channels [--json]` | per-channel trajectory: counts, means, summary |
 | `channel-state CHAT [--json]` | the full trajectory of one channel |
+| `ocr CHAT [--limit N] [--force] [--model M]` | read text off photo posts (English pass, then Russian; no text → ignored) |
+| `chart CHAT [--out PATH]` | render the channel rating: self-contained HTML + ASCII sparkline |
 | `init-db` | create tables |
 
 `fetch --all` streams TSV (id, date, sender, text) so it is safe to pipe into a file even
@@ -489,6 +491,29 @@ Posts are taken oldest first, so a fresh channel is backfilled from its very fir
 message. A run costs at most one attempt per post per tick, and short posts do not consume
 the per-tick model budget.
 
+### Photo posts go through OCR first
+
+A channel post is often a screenshot: the caption is a stub and the content is in the
+image. Before such a post is scored, its text is read off the picture:
+
+```bash
+python -m doomscroller ocr design4TOR            # English pass, then Russian
+python -m doomscroller ocr design4TOR --model google/gemma-4-26b-a4b-it   # another vision model
+```
+
+The rule is literal: pass one asks for the transcription assuming English, pass two runs
+only if the first read nothing and assumes Russian; an image that yields no text in either
+pass is recorded as `no_text` and never looked at again. Only real pictures are processed —
+webpage previews and video thumbnails are link decorations, not content. The engine is a
+vision model over the same endpoint as the scorer (`deepseek/deepseek-v4.1-flash` by
+default, ~$0.0002 per image); images are downscaled to 1600 px first, because a huge
+screenshot otherwise dies with HTTP 413.
+
+OCR text is stored in `media_ocr`, joined by `(chat_id, message_id)` — the archive itself
+stays untouched. For scoring, a post's body becomes *caption + `[текст с изображения]` +
+transcription*, and OCR that arrived after a post was scored puts the post back into the
+queue, exactly like an upstream edit.
+
 ### One transaction per post
 
 Same invariant as the ingest cursor, for the same reason:
@@ -534,6 +559,19 @@ python -m doomscroller scores somechannel --json     # everything, machine-reada
 Over MCP: `post_scores`, `channel_states`, `channel_events`, plus a `scoring` block in
 `connector_status` with counts, the models actually used and the prompt versions — all of it
 read from the database, so an MCP client needs no scorer configuration to see the results.
+
+### The rating page
+
+```bash
+python -m doomscroller chart design4TOR
+# html: reports/design4TOR.html
+```
+
+Writes a single self-contained HTML file — inline SVG, no JavaScript, no external assets —
+with the KPD of every scored post in channel order (bars colored by sphere, the EWMA trend
+line, the mean), the six axis means, sphere and tag distributions, the best and worst posts
+with `t.me` links, and the trajectory events. The same command prints an ASCII sparkline
+for the terminal.
 
 ### Calibrating against the anchors
 

@@ -31,7 +31,8 @@ from sqlmodel import Session, select
 
 from ..config import ScorerConfig
 from ..db import init_db, session_scope
-from ..models import ChannelState, Message, PostScore, Subscription, utcnow
+from ..models import ChannelState, MediaOcr, Message, PostScore, Subscription, utcnow
+from ..ocr import combined_body
 from ..subscriptions import get_subscription, list_subscriptions, normalise_ref
 from .llm import ChatClient, LLMError, LLMResponse
 from .prompts import RubricModules, load_modules, render_channel_state, render_prompt
@@ -160,7 +161,11 @@ def _timestamp(value: Optional[datetime]) -> Optional[float]:
 
 def post_title(text: str) -> str:
     """Derive an anchor title from the post itself (the rubric JSON has no title field)."""
+    from ..ocr import OCR_MARKER
+
     for line in (text or "").strip().splitlines():
+        if line.strip() == OCR_MARKER:
+            continue  # the transcription marker is bookkeeping, not a title
         candidate = line.strip()
         if not candidate:
             continue
@@ -178,6 +183,7 @@ def needs_scoring(
     force: bool,
     rescore_edited: bool,
     max_attempts: int,
+    ocr_updated: Optional[float] = None,
 ) -> bool:
     if force:
         return True
@@ -185,10 +191,14 @@ def needs_scoring(
         return True
     if score.status == "failed":
         return int(score.attempts or 0) < max_attempts
+    seen = _timestamp(score.scored_at) or _timestamp(score.updated_at)
+    # OCR text that arrived after the score changes what the rubric should have read —
+    # the same trigger as an upstream edit.
+    if ocr_updated is not None and (seen is None or ocr_updated > seen):
+        return True
     edited = _timestamp(message.edited_at)
     if edited is None or not rescore_edited:
         return False
-    seen = _timestamp(score.scored_at) or _timestamp(score.updated_at)
     return seen is None or edited > seen
 
 
@@ -201,8 +211,13 @@ def iter_pending_posts(
     max_attempts: int = 3,
     chunk: int = CHUNK,
     attempted: Optional[set[int]] = None,
-) -> Iterator[tuple[Message, Optional[PostScore]]]:
+) -> Iterator[tuple[Message, Optional[PostScore], str]]:
     """Yield posts that still need a score, oldest first, streaming over the archive.
+
+    Yields ``(message, existing_score, body)`` where ``body`` is the full text the rubric
+    should see: the caption plus, for photo posts, the text OCR read off the image. A
+    message with neither caption nor readable OCR text is silently skipped — it is not a
+    post, and a photo that OCR already declared textless stays ignored.
 
     No offset and no cursor: paging by ``message_id > last`` keeps this linear even for a
     chat with hundreds of thousands of stored messages.
@@ -220,8 +235,6 @@ def iter_pending_posts(
                     Message.chat_id == chat_id,
                     Message.message_id > after,
                     Message.deleted == False,  # noqa: E712
-                    Message.text.is_not(None),
-                    Message.text != "",
                 )
                 .order_by(Message.message_id.asc())
                 .limit(chunk)
@@ -239,8 +252,22 @@ def iter_pending_posts(
                 )
             ).all()
         }
+        ocr = {
+            row.message_id: row
+            for row in session.exec(
+                select(MediaOcr).where(
+                    MediaOcr.chat_id == chat_id,
+                    MediaOcr.status == "ok",
+                    MediaOcr.message_id.in_(ids),
+                )
+            ).all()
+        }
         for message in rows:
             if message.message_id in attempted:
+                continue
+            row = ocr.get(message.message_id)
+            body = combined_body(message.text, row.ocr_text if row else None)
+            if not body.strip():
                 continue
             score = existing.get(message.message_id)
             if needs_scoring(
@@ -249,8 +276,9 @@ def iter_pending_posts(
                 force=force,
                 rescore_edited=rescore_edited,
                 max_attempts=max_attempts,
+                ocr_updated=_timestamp(row.updated_at) if row else None,
             ):
-                yield message, score
+                yield message, score, body
 
         after = ids[-1]
         if len(rows) < chunk:
@@ -290,7 +318,8 @@ def _apply_rubric(row: PostScore, rubric: Rubric, *, model: str, version: str) -
 # ── persistence (one transaction per post) ────────────────────────────────────
 
 def store_skipped(
-    chat_id: int, message: Message, *, reason: str, window: int
+    chat_id: int, message: Message, *, reason: str, window: int,
+    body: Optional[str] = None,
 ) -> None:
     with session_scope() as session:
         state = get_or_create_state(session, chat_id=chat_id, window=window)
@@ -304,7 +333,7 @@ def store_skipped(
             row = PostScore(chat_id=chat_id, message_id=message.message_id)
         row.status = "skipped"
         row.detail = reason
-        row.title = post_title(message.text or "")
+        row.title = post_title(body if body is not None else (message.text or ""))
         row.message_date = message.date
         row.updated_at = utcnow()
         row.attempts = int(row.attempts or 0) + 1
@@ -325,6 +354,7 @@ def store_failure(
     model: str,
     version: str,
     window: int,
+    body: Optional[str] = None,
 ) -> None:
     with session_scope() as session:
         state = get_or_create_state(session, chat_id=chat_id, window=window)
@@ -338,7 +368,7 @@ def store_failure(
         previous_status = row.status
         row.status = "failed"
         row.detail = error[:1000]
-        row.title = post_title(message.text or "")
+        row.title = post_title(body if body is not None else (message.text or ""))
         row.message_date = message.date
         row.model = model
         row.prompt_version = version
@@ -359,6 +389,7 @@ def store_score(
     model: str,
     version: str,
     window: int,
+    body: Optional[str] = None,
 ) -> tuple[PostScore, list[str]]:
     """Persist the rubric row and fold it into the channel state — atomically."""
     with session_scope() as session:
@@ -372,7 +403,7 @@ def store_score(
         if row is None:
             row = PostScore(chat_id=chat_id, message_id=message.message_id)
         row.message_date = message.date
-        row.title = post_title(message.text or "")
+        row.title = post_title(body if body is not None else (message.text or ""))
         row.attempts = int(row.attempts or 0) + 1
         _apply_rubric(row, rubric, model=model, version=version)
         session.add(row)
@@ -610,10 +641,10 @@ async def _score_channel(
         if pending is None:
             break
 
-        message, _existing = pending
+        message, _existing, body = pending
         attempted.add(int(message.message_id))
         scanned += 1
-        text = message.text or ""
+        text = body
 
         if len(text.strip()) < config.min_chars:
             if dry_run:
@@ -624,6 +655,7 @@ async def _score_channel(
                 message,
                 reason=f"текст короче {config.min_chars} символов ({len(text.strip())})",
                 window=config.window,
+                body=text,
             )
             report.skipped += 1
             continue
@@ -666,6 +698,7 @@ async def _score_channel(
                 model=config.model,
                 version=prompt.version,
                 window=config.window,
+                body=text,
             )
             return report
 
@@ -684,6 +717,7 @@ async def _score_channel(
                 model=response.model,
                 version=prompt.version,
                 window=config.window,
+                body=text,
             )
             continue
 
@@ -694,6 +728,7 @@ async def _score_channel(
             model=response.model,
             version=prompt.version,
             window=config.window,
+            body=text,
         )
         report.scored += 1
         report.prompt_tokens += int(response.prompt_tokens or 0)

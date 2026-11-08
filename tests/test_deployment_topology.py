@@ -39,6 +39,10 @@ def test_the_scorer_starts_without_any_telegram_configuration():
         "TELEGRAM_API_ID": "",
         "TELEGRAM_API_HASH": "",
         "TELEGRAM_PHONE": "",
+        # The repo's own .env may legitimately set SCORER_MODEL (it does on the machine
+        # this checkout lives on). Explicit env wins over .env (override=False), so pin
+        # the default here to keep the assertion about *defaults* machine-independent.
+        "SCORER_MODEL": "deepseek-chat",
     }
     code = (
         "import json\n"

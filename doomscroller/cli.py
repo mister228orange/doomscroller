@@ -27,7 +27,7 @@ from sqlmodel import Session, select
 
 from . import __version__
 from .config import load_scorer_config, load_settings
-from .db import init_db, session_scope
+from .db import init_db, session_factory, session_scope
 from .models import ChannelEvent, ChannelState, Message, PostScore, Subscription
 from .store import (
     events_for_message,
@@ -256,6 +256,71 @@ def cmd_mcp(args) -> int:
         run(transport="stdio")
     else:
         run(transport=args.transport, host=args.host, port=args.port)
+    return 0
+
+
+async def _ocr(args) -> int:
+    """Read text off photo posts: English pass, then Russian; no text → ignored."""
+    from .ocr import DEFAULT_OCR_MODEL, ocr_channel
+    from .scoring.llm import ChatClient, LLMError
+    from .telegram_client import build_client, ensure_connected
+
+    config = load_scorer_config()
+    if not config.api_key:
+        print("ocr is not configured: SCORER_API_KEY / NANOGPT_API_KEY is not set", file=sys.stderr)
+        return 2
+    llm = ChatClient(
+        base_url=config.base_url,
+        model=args.model or DEFAULT_OCR_MODEL,
+        api_key=config.api_key,
+    )
+    settings = load_settings()
+    client = build_client(settings)
+    await ensure_connected(client, settings)
+    try:
+        report = await ocr_channel(
+            client,
+            chat_ref=args.chat,
+            llm=llm,
+            model=llm.model,
+            limit=args.limit,
+            force=args.force,
+            session_factory=session_factory,
+        )
+    except LLMError as exc:
+        print(f"ocr is not configured: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        await client.disconnect()
+
+    if args.json:
+        print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
+        return 0
+    print(
+        f"ocr {report.chat}: photos {report.photos}, read {report.ok}, "
+        f"no text {report.no_text}, skipped {report.skipped_existing}, errors {report.errors}"
+    )
+    for detail in report.error_details[:5]:
+        print(f"  {detail}", file=sys.stderr)
+    return 0
+
+
+def cmd_chart(args) -> int:
+    """Write a self-contained HTML rating page and print the ASCII view."""
+    from .chart import collect_chart_data, render_ascii, render_html
+
+    init_db()
+    with session_scope() as session:
+        chat_id = _resolve_chat_id(session, args.chat)
+        data = collect_chart_data(session, chat_id)
+    if not data["posts"]:
+        print("(no scored posts yet for that channel — run `doomscroller score` first)")
+        return 0
+    out = Path(args.out) if args.out else Path("reports") / f"{args.chat.lstrip('@')}.html"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_html(data), encoding="utf-8")
+    print(f"html: {out}")
+    print(render_ascii(data))
     return 0
 
 
@@ -1022,6 +1087,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--events", type=int, default=10)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_channel_state)
+
+    s = sub.add_parser(
+        "ocr",
+        help="read text from photo posts: English pass, then Russian; no text → ignored",
+    )
+    s.add_argument("chat", help="chat reference, e.g. design4TOR or t.me/design4TOR")
+    s.add_argument("--limit", type=int, default=200, help="how many recent messages to scan")
+    s.add_argument("--force", action="store_true", help="re-read images already OCR'd")
+    s.add_argument("--model", default=None, help="vision model (default: deepseek/deepseek-v4.1-flash)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=lambda a: _run_async(_ocr(a)))
+
+    s = sub.add_parser("chart", help="render the channel rating (self-contained HTML + ASCII)")
+    s.add_argument("chat", help="chat reference, e.g. design4TOR")
+    s.add_argument("--out", default=None, help="output path (default: reports/<chat>.html)")
+    s.set_defaults(func=cmd_chart)
 
     s = sub.add_parser("init-db", help="create tables")
     s.set_defaults(func=cmd_init_db)

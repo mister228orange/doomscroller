@@ -11,6 +11,7 @@ from sqlmodel import select
 from doomscroller.models import ChannelEvent, PostScore
 from doomscroller.scoring.state import (
     DEVIATION_FLAG,
+    MIN_POSTS_FOR_SHIFT,
     PEAK_MIN_KPD,
     SHIFT_STREAK,
     apply_score,
@@ -85,7 +86,8 @@ def test_score_row_carries_its_own_channel_view(session, state):
     row = session.exec(select(PostScore).where(PostScore.message_id == 2)).one()
     assert row.deviation["I"] == pytest.approx(1.5)
     assert row.trend_position in {"above", "at", "below"}
-    assert row.shift_candidate is True  # 2+ axes moved by >= 1.5
+    # A trend does not exist yet: shift detection waits for MIN_POSTS_FOR_SHIFT posts.
+    assert row.shift_candidate is False
 
 
 def test_tag_distribution_and_anchors_are_kept(session, state):
@@ -111,9 +113,11 @@ def test_weak_first_post_does_not_create_a_peak_event(session, state):
 
 
 def test_shift_requires_a_streak_of_candidates(session, state):
-    _score(session, state, 1)  # first post: no trend to deviate from
+    # Posts 1..9 conform: the trend has to exist before it can be shifted.
+    for i in range(1, MIN_POSTS_FOR_SHIFT):
+        _score(session, state, i)
     candidates = 0
-    for i in range(2, 2 + SHIFT_STREAK):
+    for i in range(MIN_POSTS_FOR_SHIFT, MIN_POSTS_FOR_SHIFT + SHIFT_STREAK):
         flags = _score(session, state, i, I=10.0, V=1.0, U=1.0, D=1.0)
         assert any(flag.startswith("deviation:") for flag in flags)
         candidates += 1
@@ -122,6 +126,21 @@ def test_shift_requires_a_streak_of_candidates(session, state):
             assert shifts == 0, "a shift must not be recorded before the streak completes"
     assert shifts == 1
     assert state.deviation_streak == 0
+
+
+def test_shifts_are_silent_before_the_trend_exists(session, state):
+    """Five extreme posts in a row, all before the tenth: no shift, no streak.
+
+    With a window of 5 the early mean is built from one or two scores, so any strong
+    post would look like a shift — that noise is exactly what the gate removes.
+    """
+    _score(session, state, 1)
+    for i in range(2, 7):
+        _score(session, state, i, I=10.0, V=1.0, U=1.0, D=1.0)
+        row = session.exec(select(PostScore).where(PostScore.message_id == i)).one()
+        assert row.shift_candidate is False, "too early for shift candidates"
+    assert session.exec(select(ChannelEvent).where(ChannelEvent.kind == "shift")).all() == []
+    assert int(state.deviation_streak or 0) == 0
 
 
 def test_deviation_streak_resets_on_a_conforming_post(session, state):

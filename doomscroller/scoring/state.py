@@ -37,6 +37,10 @@ SHIFT_DELTA = 1.5
 SHIFT_AXES = 2
 #: Consecutive candidates needed before a shift is recorded as an event.
 SHIFT_STREAK = 3
+#: A trend is not a trend until it exists. With an EWMA window of 5, the first posts compare
+#: against a mean built from one or two scores, so any strong post looks like a shift. Shift
+#: detection only starts once this many posts have been scored in the channel.
+MIN_POSTS_FOR_SHIFT = 10
 #: A new channel best is only an event once it clears this.
 PEAK_MIN_KPD = 7.5
 #: |KPD - KPD_mean| inside this band is "at" the trend.
@@ -220,8 +224,10 @@ def apply_score(
                 payload={"kpd": score.kpd},
             )
 
-    # Shift detection: a run of posts that all move strongly on two or more axes.
-    candidate = len(strong_axes) >= SHIFT_AXES
+    # Shift detection: a run of posts that all move strongly on two or more axes. Gated on
+    # MIN_POSTS_FOR_SHIFT: early posts would compare against a one-score "trend" and every
+    # strong post would look like a shift.
+    candidate = len(strong_axes) >= SHIFT_AXES and int(state.total_scored) >= MIN_POSTS_FOR_SHIFT
     score.shift_candidate = candidate
     if candidate:
         state.deviation_streak = int(state.deviation_streak or 0) + 1

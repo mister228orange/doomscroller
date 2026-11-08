@@ -149,3 +149,19 @@ class FakeScorerLLM:
         return LLMResponse(
             text=answer, model="fake-model", prompt_tokens=1000, completion_tokens=100
         )
+
+    async def chat_raw(self, messages, *, json_mode=None, max_tokens=None):
+        """Raw-message variant used by the OCR engine (vision payloads)."""
+        from doomscroller.scoring.llm import LLMResponse
+
+        self.raw_prompts = getattr(self, "raw_prompts", [])
+        self.raw_prompts.append(messages)
+        if self.answers:
+            answer = self.answers.pop(0)
+        else:
+            answer = self.default
+        if isinstance(answer, Exception):
+            raise answer
+        return LLMResponse(
+            text=answer, model="fake-vision", prompt_tokens=1500, completion_tokens=80
+        )
