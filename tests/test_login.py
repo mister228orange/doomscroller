@@ -98,3 +98,19 @@ def test_two_factor_asks_for_the_password(tmp_path, monkeypatch):
     )
     assert result["status"] == "logged in"
     assert client.sign_in_kwargs == {"password": "hunter2"}
+
+
+def test_a_tty_terminal_is_asked_for_the_code_in_the_same_process(tmp_path, monkeypatch):
+    """One command for a human: the code prompt happens inside the same run."""
+    import sys
+
+    client = FakeClient(tmp_path, authorized=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "  54321 ")
+    result = asyncio.run(login_flow(client, _settings()))
+    assert result["status"] == "logged in"
+    assert client.sign_in_kwargs == {
+        "phone": PHONE,
+        "code": "54321",
+        "phone_code_hash": "hash-123",
+    }

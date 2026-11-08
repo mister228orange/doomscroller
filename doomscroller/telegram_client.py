@@ -100,11 +100,19 @@ async def login_flow(
         return {"status": "already authorized", "user": getattr(me, "username", None) or ""}
     if not code:
         sent = await client.send_code_request(settings.phone)
-        return {
-            "status": "code sent",
-            "phone_code_hash": sent.phone_code_hash or "",
-            "next": 'doomscroller login --code <КОД> --hash <phone_code_hash>',
-        }
+        phone_code_hash = sent.phone_code_hash or ""
+        import sys
+
+        if sys.stdin.isatty():
+            # A human at the terminal: ask for the code right here, same process, the
+            # hash never has to leave memory.
+            code = input("Код из Telegram: ").strip()
+        else:
+            return {
+                "status": "code sent",
+                "phone_code_hash": phone_code_hash,
+                "next": "doomscroller login --code <код> --hash <phone_code_hash>",
+            }
     try:
         await client.sign_in(phone=settings.phone, code=code, phone_code_hash=phone_code_hash)
     except SessionPasswordNeededError:

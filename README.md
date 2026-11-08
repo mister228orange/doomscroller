@@ -137,12 +137,13 @@ Or the resumable two-command login — it also heals a session that Telegram rev
 automatically):
 
 ```bash
-python -m doomscroller login                          # sends the code, prints phone_code_hash
-python -m doomscroller login --code 54321 --hash <phone_code_hash>
+python -m doomscroller login        # asks for the code from Telegram right there
 ```
 
-Two-factor accounts are asked for the password on the second command. The same flow works
-for the MCP session by pointing `TELEGRAM_MCP_SESSION` at a fresh file.
+One command: it sends the code, asks for it, and handles the two-factor password prompt.
+Without a terminal (scripts) it falls back to printing `phone_code_hash` for a second call
+with `--code` and `--hash`. The same flow works for the MCP session by pointing
+`TELEGRAM_MCP_SESSION` at a fresh file.
 
 The session file lives at `$DATA_DIR/$TELEGRAM_SESSION.session`. Compose mounts the repo at
 `/app` with `DATA_DIR=/app`, so an existing `scroller_session.session` at the repo root is
