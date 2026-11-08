@@ -12,9 +12,11 @@ from doomscroller.scoring.agent import (
     post_title,
     run_agent,
     store_score,
+    iter_pending_posts,
 )
 from doomscroller.scoring.llm import LLMError
-from doomscroller.scoring.rubric import finalize
+from doomscroller.scoring.prompts import load_modules
+from doomscroller.scoring.rubric import finalize, parse_anchors
 from doomscroller.store import record_event
 from doomscroller.subscriptions import subscribe
 
@@ -419,3 +421,82 @@ def test_needs_scoring_matrix():
     assert not needs_scoring(message, exhausted, force=False, rescore_edited=True, max_attempts=3)
     retryable = PostScore(chat_id=1, message_id=1, status="failed", attempts=1)
     assert needs_scoring(message, retryable, force=False, rescore_edited=True, max_attempts=3)
+
+
+def test_sampling_reads_every_nth_post_only(session):
+    """1-из-5: новые кандидаты — только message_id % 5 == 0; уже оценённые — всегда."""
+    _seed(session, count=10)
+    pending = list(
+        iter_pending_posts(
+            session, chat_id=CHAT, force=False, rescore_edited=False, sample_every=5
+        )
+    )
+    ids = [item[0].message_id for item in pending]
+    assert ids == [5, 10], ids
+
+
+def test_sampling_never_drops_a_post_that_already_has_a_row(session):
+    """Rescore (edit/OCR) is not subject to sampling — only first-time reads are."""
+    _seed(session, count=10)
+    llm = FakeScorerLLM([])
+    modules = load_modules()
+    anchors = parse_anchors(load_modules().anchor_text)
+
+    from doomscroller.scoring.rubric import extract_json, finalize
+
+    # Score post 3 with sampling off: it now carries a score row while sitting outside
+    # the 1-of-5 sample.
+    message, _score, body = next(
+        iter(
+            iter_pending_posts(
+                session, chat_id=CHAT, force=True, rescore_edited=False, sample_every=5
+            )
+        )
+    )
+    assert message.message_id == 1
+    rubric = finalize(extract_json(llm.default), anchors=anchors, genre_hint=None)
+    store_score(CHAT, message, rubric, model="m", version=modules.version, window=5, body=body)
+
+    # An OCR row newer than that score pulls post 3 back into the queue — sampling or not.
+    from datetime import timedelta
+
+    from doomscroller.models import MediaOcr, utcnow
+
+    session.add(
+        MediaOcr(
+            chat_id=CHAT, message_id=1, status="ok", ocr_text="дописанный текст со скриншота",
+            updated_at=utcnow() + timedelta(seconds=10),
+        )
+    )
+    session.commit()
+    pending = list(
+        iter_pending_posts(
+            session, chat_id=CHAT, force=False, rescore_edited=False, sample_every=5
+        )
+    )
+    ids = [item[0].message_id for item in pending]
+    assert 1 in ids and 5 in ids and 10 in ids, ids
+    # and a never-scored post outside the sample stays out even with OCR text
+    session.add(
+        MediaOcr(
+            chat_id=CHAT, message_id=3, status="ok", ocr_text="текст без оценки",
+            updated_at=utcnow() + timedelta(seconds=10),
+        )
+    )
+    session.commit()
+    pending = list(
+        iter_pending_posts(
+            session, chat_id=CHAT, force=False, rescore_edited=False, sample_every=5
+        )
+    )
+    assert [item[0].message_id for item in pending] == [1, 5, 10]
+
+
+def test_force_bypasses_sampling(session):
+    _seed(session, count=10)
+    pending = list(
+        iter_pending_posts(
+            session, chat_id=CHAT, force=True, rescore_edited=False, sample_every=5
+        )
+    )
+    assert len(pending) == 10

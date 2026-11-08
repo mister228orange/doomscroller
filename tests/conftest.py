@@ -28,6 +28,10 @@ def _url() -> str:
 # The application reads DATABASE_URL via doomscroller.db; point it at the test database
 # so MCP tools and CLI paths hit the same place as the fixtures.
 os.environ.setdefault("DATABASE_URL", _url())
+# The repo's own .env may carry deployment choices (sampling, model); explicit env wins
+# over .env (override=False), so pin the reading defaults to keep tests deterministic.
+os.environ.setdefault("SCORER_SAMPLE_EVERY", "1")
+os.environ.setdefault("SCORER_REASONING_EFFORT", "none")
 
 
 @pytest.fixture(scope="session")

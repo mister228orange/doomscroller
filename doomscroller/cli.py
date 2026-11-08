@@ -751,6 +751,8 @@ async def _score(args) -> int:
     config = load_scorer_config()
     if args.genre:
         config.genre = args.genre
+    if getattr(args, "sample_every", None):
+        config.sample_every = args.sample_every
     if args.check or args.list_models is not None:
         return await _score_doctor(config, args)
     summary_every = 0 if args.no_summary else args.summary_every
@@ -1094,6 +1096,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--summary-every", type=int, default=None, help="refresh channel memory every N posts")
     s.add_argument("--no-summary", action="store_true", help="never refresh the channel memory")
     s.add_argument("--genre", default=None, help="fix the genre for every post of this run")
+    s.add_argument(
+        "--sample-every",
+        type=int,
+        default=None,
+        help="read every Nth post (default: SCORER_SAMPLE_EVERY); 1 = everything",
+    )
     s.add_argument(
         "--check",
         action="store_true",

@@ -479,6 +479,7 @@ SCORER_MODEL=qwen2.5:32b
 | `SCORER_WINDOW` | `5` | EWMA window of the channel trend |
 | `SCORER_JSON_MODE` | `auto` | ask the backend for JSON; falls back if it rejects it |
 | `SCORER_REASONING_EFFORT` | *(model decides)* | pin the thinking budget (`none` stops a reasoning model burning 4–7k output tokens per post) |
+| `SCORER_SAMPLE_EVERY` | `1` | read every Nth post (1-из-5 = `5`); first-time reads only, `--force` and rescores ignore it |
 
 Inside compose, `python -m doomscroller score --loop` is the `scorer` service — a separate
 container from the poller, with a separate environment:

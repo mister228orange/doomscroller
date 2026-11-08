@@ -227,6 +227,9 @@ class ScorerConfig:
     #: Pin the model's thinking budget (e.g. `none` for a reasoning model that starts
     #: burning thousands of output tokens per post). Empty means let the model decide.
     reasoning_effort: Optional[str] = None
+    #: Read every Nth post (by message_id modulo). 1 = read everything. Sampling gates
+    #: first-time scoring only; `--force` and rescores ignore it.
+    sample_every: int = 1
     #: Posts shorter than this are archived but not rubric material — they are recorded
     #: as `skipped` so a one-word post cannot be scored as if it were an essay.
     min_chars: int = 120
@@ -261,6 +264,7 @@ def load_scorer_config() -> ScorerConfig:
         json_mode=(_env("SCORER_JSON_MODE", "auto") or "auto").lower(),
         max_tokens=_env_int("SCORER_MAX_TOKENS", 0),
         reasoning_effort=_env("SCORER_REASONING_EFFORT") or None,
+        sample_every=_env_int("SCORER_SAMPLE_EVERY", 1),
         min_chars=_env_int("SCORER_MIN_CHARS", 120),
         max_chars=_env_int("SCORER_MAX_CHARS", 12000),
         max_posts_per_run=_env_int("SCORER_MAX_POSTS_PER_RUN", 20),

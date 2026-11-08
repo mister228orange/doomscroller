@@ -211,6 +211,7 @@ def iter_pending_posts(
     max_attempts: int = 3,
     chunk: int = CHUNK,
     attempted: Optional[set[int]] = None,
+    sample_every: int = 1,
 ) -> Iterator[tuple[Message, Optional[PostScore], str]]:
     """Yield posts that still need a score, oldest first, streaming over the archive.
 
@@ -226,6 +227,8 @@ def iter_pending_posts(
     per tick. A failed post is retried on the *next* tick, not immediately in a loop.
     """
     attempted = attempted if attempted is not None else set()
+    if force:
+        sample_every = 1  # an explicit full pass reads everything
     after = 0
     while True:
         rows = list(
@@ -265,11 +268,21 @@ def iter_pending_posts(
         for message in rows:
             if message.message_id in attempted:
                 continue
+            score = existing.get(message.message_id)
+            # Sampling gates first-time scoring only: a post already carrying a score row
+            # (or being rescored) is always in. The modulo is on message_id, so a post is
+            # either always in the sample or always out — raising `sample_every` later
+            # reads the rest without re-reading the sample.
+            if (
+                score is None
+                and sample_every > 1
+                and message.message_id % sample_every != 0
+            ):
+                continue
             row = ocr.get(message.message_id)
             body = combined_body(message.text, row.ocr_text if row else None)
             if not body.strip():
                 continue
-            score = existing.get(message.message_id)
             if needs_scoring(
                 message,
                 score,
@@ -635,6 +648,7 @@ async def _score_channel(
                     rescore_edited=rescore_edited,
                     max_attempts=config.max_attempts,
                     attempted=attempted,
+                    sample_every=config.sample_every,
                 ),
                 None,
             )
