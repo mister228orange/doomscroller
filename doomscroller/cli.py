@@ -259,6 +259,24 @@ def cmd_mcp(args) -> int:
     return 0
 
 
+async def _login(args) -> int:
+    """Terminal login in one or two commands; heals a Telegram-revoked session."""
+    from .telegram_client import build_client, login_flow
+
+    settings = load_settings()
+    if not settings.phone:
+        print("TELEGRAM_PHONE is not set", file=sys.stderr)
+        return 2
+    client = build_client(settings)
+    try:
+        result = await login_flow(client, settings, code=args.code, phone_code_hash=args.hash)
+    finally:
+        await client.disconnect()
+    for key, value in result.items():
+        print(f"{key}: {value}")
+    return 0 if result.get("status") != "error" else 1
+
+
 async def _ocr(args) -> int:
     """Read text off photo posts: English pass, then Russian; no text → ignored."""
     from .ocr import DEFAULT_OCR_MODEL, ocr_channel
@@ -1030,6 +1048,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("stats", help="counts per table")
     s.set_defaults(func=cmd_stats)
+
+    s = sub.add_parser(
+        "login",
+        help="request a login code, then sign in: `login` then `login --code N --hash H`",
+    )
+    s.add_argument("--code", default=None, help="the code Telegram sent (phase 2)")
+    s.add_argument("--hash", default=None, help="phone_code_hash printed by phase 1")
+    s.set_defaults(func=lambda a: _run_async(_login(a)))
 
     s = sub.add_parser("chats", help="list Telegram chats visible to the account (live)")
     s.add_argument("--limit", type=int, default=200)

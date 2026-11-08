@@ -104,6 +104,7 @@ python -m doomscroller fetch @somechannel --limit 50
 | `search QUERY [--chat REF] [--limit N]` | substring search across stored messages |
 | `events CHAT MESSAGE_ID` | raw event log for one message |
 | `stats` | row counts per table |
+| `login [--code N] [--hash H]` | request the login code, then sign in (heals a revoked session) |
 | `chats [--limit N]` | list Telegram chats visible to the account (live, needs the session) |
 | `send CHAT TEXT` | send a message (refused unless the chat is in `SEND_ALLOWLIST`) |
 | `export CHAT... [--limit N]` | dump recent messages of one or more chats to JSON |
@@ -130,6 +131,18 @@ docker compose run --rm -it doomscroller python -c \
    from doomscroller.telegram_client import build_client; \
    s=load_settings(); c=build_client(s); asyncio.run(c.start(phone=s.phone))"
 ```
+
+Or the resumable two-command login — it also heals a session that Telegram revoked
+(`AuthKeyDuplicatedError`, the key was seen from two IPs; the dead file is moved aside
+automatically):
+
+```bash
+python -m doomscroller login                          # sends the code, prints phone_code_hash
+python -m doomscroller login --code 54321 --hash <phone_code_hash>
+```
+
+Two-factor accounts are asked for the password on the second command. The same flow works
+for the MCP session by pointing `TELEGRAM_MCP_SESSION` at a fresh file.
 
 The session file lives at `$DATA_DIR/$TELEGRAM_SESSION.session`. Compose mounts the repo at
 `/app` with `DATA_DIR=/app`, so an existing `scroller_session.session` at the repo root is

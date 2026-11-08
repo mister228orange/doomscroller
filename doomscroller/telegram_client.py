@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import logging
 from typing import Any, Optional
 
@@ -61,3 +63,52 @@ def describe_entity(entity: Any) -> tuple[Optional[str], Optional[str], Optional
         or (getattr(entity, "first_name", "") or "")
     )
     return (title or None), kind, chat_id
+
+
+async def login_flow(
+    client: TelegramClient,
+    settings: Settings,
+    *,
+    code: str | None = None,
+    phone_code_hash: str | None = None,
+) -> dict[str, str]:
+    """One or both phases of a terminal login.
+
+    Phase 1 (no ``code``): request the login code and return the phone_code_hash the
+    caller must hand back to phase 2 — Telethon keeps it in memory only, so a two-command
+    login needs it echoed. Phase 2: sign in with the code; two-factor accounts are asked
+    for the password via getpass. A session revoked by Telegram
+    (``AuthKeyDuplicatedError`` — the key was seen from two IPs) is moved aside so the
+    fresh login starts on a clean file instead of dying on connect.
+    """
+    import getpass
+    from datetime import datetime, timezone
+
+    from telethon.errors import AuthKeyDuplicatedError, SessionPasswordNeededError
+
+    try:
+        if not client.is_connected():
+            await client.connect()
+    except AuthKeyDuplicatedError:
+        stale = Path(str(client.session.filename or ""))
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        moved = stale.with_name(f"{stale.stem}.revoked-{stamp}{stale.suffix}")
+        stale.rename(moved)
+        await client.connect()
+    if await client.is_user_authorized():
+        me = await client.get_me()
+        return {"status": "already authorized", "user": getattr(me, "username", None) or ""}
+    if not code:
+        sent = await client.send_code_request(settings.phone)
+        return {
+            "status": "code sent",
+            "phone_code_hash": sent.phone_code_hash or "",
+            "next": 'doomscroller login --code <КОД> --hash <phone_code_hash>',
+        }
+    try:
+        await client.sign_in(phone=settings.phone, code=code, phone_code_hash=phone_code_hash)
+    except SessionPasswordNeededError:
+        password = getpass.getpass("2FA password: ")
+        await client.sign_in(password=password)
+    me = await client.get_me()
+    return {"status": "logged in", "user": getattr(me, "username", None) or ""}
