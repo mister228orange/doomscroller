@@ -305,6 +305,27 @@ async def _ocr(args) -> int:
     return 0
 
 
+def cmd_compare(args) -> int:
+    """Cross-channel statistics: volume, KPD spread, axes, spheres, best posts."""
+    from .compare import collect_comparison, render_table
+
+    init_db()
+    with session_scope() as session:
+        chat_ids = [_resolve_chat_id(session, ref) for ref in args.chats]
+        states = {
+            int(state.chat_id): state.chat_ref
+            for state in session.exec(select(ChannelState)).all()
+            if state.chat_ref
+        }
+        refs = [states.get(chat_id, args.chats[index]) for index, chat_id in enumerate(chat_ids)]
+        data = collect_comparison(session, refs)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    print(render_table(data))
+    return 0
+
+
 def cmd_chart(args) -> int:
     """Write a self-contained HTML rating page and print the ASCII view."""
     from .chart import collect_chart_data, render_ascii, render_html
@@ -1098,6 +1119,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model", default=None, help="vision model (default: deepseek/deepseek-v4.1-flash)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=lambda a: _run_async(_ocr(a)))
+
+    s = sub.add_parser("compare", help="side-by-side statistics for two or more channels")
+    s.add_argument("chats", nargs="+", help="chat references, e.g. design4TOR bukvy_znaesh")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_compare)
 
     s = sub.add_parser("chart", help="render the channel rating (self-contained HTML + ASCII)")
     s.add_argument("chat", help="chat reference, e.g. design4TOR")

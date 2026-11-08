@@ -246,7 +246,21 @@ async def ocr_channel(
             ).all()
         }
 
-    async for message in client.iter_messages(entity, limit=limit):
+    iterator = client.iter_messages(entity, limit=limit)
+    while True:
+        try:
+            message = await iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        except Exception as exc:  # noqa: BLE001 — a desynced connection must not lose the pass
+            # Telethon can hit a malformed server response mid-iteration (the exception text
+            # is raw protocol bytes). Everything committed so far stays; the next run
+            # resumes from the first message without an OCR row.
+            truncated = str(exc)[:160].replace("\n", " ")
+            logger.error("ocr pass interrupted after %d processed: %s", report.processed, truncated)
+            report.errors += 1
+            report.error_details.append(f"iteration interrupted: {truncated}")
+            break
         if not is_image_message(message):
             # Webpage previews, videos, non-image documents: not OCR material. An error
             # row left behind by an earlier, less careful pass is closed out here so it

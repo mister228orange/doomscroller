@@ -7,6 +7,7 @@ matter when someone pays per token: wrong key, empty balance, unknown model.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -338,3 +339,28 @@ async def test_list_models_filters_and_sorts():
         "openai/gpt-x",
     ]
     assert await client.list_models("v4") == ["deepseek/deepseek-v4.1-flash"]
+
+
+def test_reasoning_effort_is_sent_only_when_configured():
+    """A pinned thinking budget rides every payload; unset means the field is absent."""
+    import json as _json
+
+    async def run(effort: str | None) -> dict:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return _ok_response()
+
+        client = ChatClient(
+            base_url=NANOGPT_BASE_URL,
+            model="deepseek/deepseek-v4-pro",
+            api_key="sk-test",
+            transport=httpx.MockTransport(handler),
+            reasoning_effort=effort,
+        )
+        await client.chat(system="sys", user="usr")
+        return _json.loads(seen[-1].content.decode("utf-8"))
+
+    assert asyncio.run(run("none"))["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in asyncio.run(run(None))

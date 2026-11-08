@@ -81,6 +81,7 @@ class ChatClient:
         retries: int = 2,
         json_mode: str = "auto",
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         extra_headers: Optional[dict[str, str]] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
@@ -106,6 +107,9 @@ class ChatClient:
         self.retries = max(0, retries)
         self.json_mode = json_mode.lower()
         self.max_tokens = max_tokens
+        #: none | low | high | max — model-specific; sent only when configured, so
+        #: backends that do not know the field keep seeing the same payload shape.
+        self.reasoning_effort = reasoning_effort
         self._extra_headers = extra_headers or {}
         self._transport = transport
         self._client: Optional[httpx.AsyncClient] = None
@@ -207,6 +211,8 @@ class ChatClient:
         }
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         if self.json_mode == "on" or (self.json_mode == "auto" and self._json_mode_works):
             payload["response_format"] = {"type": "json_object"}
         return await self._send_with_retries(payload)
@@ -233,6 +239,8 @@ class ChatClient:
         limit = self.max_tokens if max_tokens is None else max_tokens
         if limit:
             payload["max_tokens"] = limit
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         if json_mode is True or (
             json_mode is None
             and (self.json_mode == "on" or (self.json_mode == "auto" and self._json_mode_works))

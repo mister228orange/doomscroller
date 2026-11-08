@@ -803,6 +803,7 @@ async def run_agent(
             retries=config.retries,
             json_mode=config.json_mode,
             max_tokens=config.max_tokens or None,
+            reasoning_effort=config.reasoning_effort,
         )
         await backend.__aenter__()  # type: ignore[attr-defined]
 

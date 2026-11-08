@@ -113,6 +113,7 @@ python -m doomscroller fetch @somechannel --limit 50
 | `channel-state CHAT [--json]` | the full trajectory of one channel |
 | `ocr CHAT [--limit N] [--force] [--model M]` | read text off photo posts (English pass, then Russian; no text → ignored) |
 | `chart CHAT [--out PATH]` | render the channel rating: self-contained HTML + ASCII sparkline |
+| `compare CHAT... [--json]` | side-by-side statistics: volume, KPD spread, axes, spheres, best posts |
 | `init-db` | create tables |
 
 `fetch --all` streams TSV (id, date, sender, text) so it is safe to pipe into a file even
@@ -463,6 +464,7 @@ SCORER_MODEL=qwen2.5:32b
 | `SCORER_SUMMARY_EVERY` | `5` | rebuild the channel memory every N posts (`0` = never) |
 | `SCORER_WINDOW` | `5` | EWMA window of the channel trend |
 | `SCORER_JSON_MODE` | `auto` | ask the backend for JSON; falls back if it rejects it |
+| `SCORER_REASONING_EFFORT` | *(model decides)* | pin the thinking budget (`none` stops a reasoning model burning 4–7k output tokens per post) |
 
 Inside compose, `python -m doomscroller score --loop` is the `scorer` service — a separate
 container from the poller, with a separate environment:
