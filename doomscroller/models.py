@@ -21,6 +21,10 @@ Three more tables hold the scoring of the archive (see ``doomscroller/scoring``)
                         distribution, local anchors, rolling summary, counters.
 * ``channel_events``  — append-only log of trajectory events (shift / peak / summary).
                         Same rule as ``message_events``: never updated, never deleted.
+
+And one table for delivery:
+
+* ``chat_webhooks``   — where to POST arriving messages of a chat (one row per chat).
 """
 
 from __future__ import annotations
@@ -451,6 +455,50 @@ class MediaOcr(SQLModel, table=True):
         default=None, sa_column=Column("completion_tokens", Integer, nullable=True)
     )
 
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column("created_at", DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column("updated_at", DateTime(timezone=True), nullable=False),
+    )
+
+
+class ChatWebhook(SQLModel, table=True):
+    """Where to POST arriving messages of one chat.
+
+    One row per chat: subscribing the same chat again replaces the URL instead of piling
+    up deliveries. ``token`` authenticates the call — the endpoint is otherwise an open
+    outbound-forwarder, so an unauthenticated subscribe would be a standing SSRF.
+    """
+
+    __tablename__ = "chat_webhooks"
+    __table_args__ = (UniqueConstraint("chat_id", name="uq_chat_webhooks_chat"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chat_id: int = Field(sa_column=Column("chat_id", BigInteger, nullable=False, index=True))
+    chat_ref: Optional[str] = Field(
+        default=None, sa_column=Column("chat_ref", Text, nullable=True)
+    )
+    url: str = Field(sa_column=Column("url", Text, nullable=False))
+    enabled: bool = Field(
+        default=True, sa_column=Column("enabled", Boolean, nullable=False, server_default="true")
+    )
+    #: Deliveries attempted / failed, so a dead endpoint is visible without logs.
+    delivered: int = Field(
+        default=0, sa_column=Column("delivered", BigInteger, nullable=False, server_default="0")
+    )
+    failed: int = Field(
+        default=0, sa_column=Column("failed", BigInteger, nullable=False, server_default="0")
+    )
+    last_error: Optional[str] = Field(
+        default=None, sa_column=Column("last_error", Text, nullable=True)
+    )
+    last_delivered_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column("last_delivered_at", DateTime(timezone=True), nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=utcnow,
         sa_column=Column("created_at", DateTime(timezone=True), nullable=False),

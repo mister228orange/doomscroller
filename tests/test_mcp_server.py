@@ -21,6 +21,7 @@ from doomscroller.store import record_event
 from doomscroller.subscriptions import subscribe
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ORIGINAL_DB_URL = os.environ.get("DATABASE_URL", "")
 
 EXPECTED_TOOLS = {
     "list_picked_chats",
@@ -29,12 +30,16 @@ EXPECTED_TOOLS = {
     "new_messages",
     "search_messages",
     "message_events",
+    "chat_history",
     "archive_stats",
     "list_chats",
     "send_message",
     "post_scores",
     "channel_states",
     "channel_events",
+    "webhook_subscribe",
+    "webhook_unsubscribe",
+    "webhook_list",
 }
 
 
@@ -141,6 +146,62 @@ async def test_connector_status_reports_readiness(session):
     assert "secret" not in json.dumps(payload["telegram"]).lower()
 
 
+async def test_chat_history_is_one_flat_compressed_array(session):
+    _seed(session)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool("chat_history", {"chat": "seedchat"})))
+    assert isinstance(payload, list)
+    # oldest first, every stored message, and a lean shape — nothing but the essentials
+    assert [m["id"] for m in payload] == [1, 2, 3, 4, 5]
+    assert set(payload[0]) <= {"id", "date", "from", "t", "more"}
+    assert payload[0]["from"] == "alice"
+    assert payload[1]["t"] == "hello 2 (edited)"  # edits land in the current text
+    assert all("reply_to" not in m and "deleted" not in m for m in payload)
+
+
+async def test_chat_history_truncates_and_strips_noise(session):
+    record_event(
+        session,
+        chat_id=-1005550002222,
+        message_id=1,
+        event_type="new",
+        text="see https://example.com/a/very/long/link and buy  now",
+        sender_name="bob",
+    )
+    session.commit()
+    sub = subscribe(session, "noisechat")
+    sub.chat_id = -1005550002222
+    session.commit()
+    async with Client(mcp) as client:
+        payload = json.loads(
+            _text(await client.call_tool("chat_history", {"chat": "noisechat", "limit": 10}))
+        )
+    item = payload[0]
+    assert "example.com" not in item["t"]  # URLs are dropped
+    assert "  " not in item["t"]  # whitespace collapsed
+    assert item["t"] == "see and buy now"[:10]
+    assert item["more"] is True
+
+
+async def test_chat_history_limit_zero_keeps_no_text(session):
+    _seed(session)
+    async with Client(mcp) as client:
+        payload = json.loads(
+            _text(await client.call_tool("chat_history", {"chat": "seedchat", "limit": 0}))
+        )
+    assert [m["t"] for m in payload] == [""] * 5
+    assert payload[0]["more"] is True  # text existed, it was just cut away
+
+
+async def test_chat_history_after_id(session):
+    _seed(session)
+    async with Client(mcp) as client:
+        payload = json.loads(
+            _text(await client.call_tool("chat_history", {"chat": "seedchat", "after_id": 3}))
+        )
+    assert [m["id"] for m in payload] == [4, 5]
+
+
 async def test_stdio_subprocess_speaks_mcp(session):
     """The real transport DSH uses: spawn the server, handshake, call a tool."""
     _seed(session)
@@ -237,3 +298,62 @@ async def test_connector_status_reports_scoring_readiness(session):
         payload = json.loads(_text(await client.call_tool("connector_status", {})))
     assert payload["scoring"]["scored_posts"] == 2
     assert payload["scoring"]["channels"] == 1
+
+
+# ── connector_status must answer, never hang ────────────────────────────────
+#
+# The client gives a tool call ~30 s and then reports a bare "Request timed out". A hanging
+# database used to burn exactly that budget: there was no connect timeout, so the report
+# never came back and the agent had no idea what was wrong.
+
+def _reset_engine(url: str) -> None:
+    from doomscroller import db as db_module
+
+    db_module._engine = None
+    os.environ["DATABASE_URL"] = url
+
+
+async def test_connector_status_returns_a_report_when_the_database_is_down():
+    _reset_engine("postgresql+psycopg://doomscroller:doomscroller@127.0.0.1:5999/doomscroller")
+    try:
+        async with Client(mcp) as client:
+            payload = json.loads(_text(await client.call_tool("connector_status", {})))
+    finally:
+        _reset_engine(os.environ.get("TEST_DATABASE_URL") or _ORIGINAL_DB_URL)
+    assert payload["database"]["ok"] is False
+    assert payload["database"]["error"]
+    assert isinstance(payload["database"].get("hint"), str)
+    # configuration is reported even when the database is unreachable
+    assert "telegram" in payload
+
+
+async def test_db_connect_args_bound_the_connect_timeout():
+    from doomscroller.db import _connect_args
+
+    assert _connect_args("postgresql+psycopg://u:p@h:5432/db") == {"connect_timeout": 5}
+    assert _connect_args("sqlite:///tmp/x.sqlite") == {}
+    # an explicit query parameter wins over the default
+    assert _connect_args("postgresql+psycopg://u:p@h:5432/db?connect_timeout=2") == {}
+
+    os.environ["DB_CONNECT_TIMEOUT"] = "1"
+    try:
+        assert _connect_args("postgresql+psycopg://u:p@h:5432/db") == {"connect_timeout": 1}
+    finally:
+        os.environ.pop("DB_CONNECT_TIMEOUT", None)
+
+
+async def test_connector_status_reports_a_query_failure(session, monkeypatch):
+    """A reachable DB whose tables/query blow up must still produce a report."""
+    _seed(session)
+    import doomscroller.mcp_server as server
+
+    def boom(_session):
+        raise RuntimeError("relation \"messages\" does not exist")
+
+    monkeypatch.setattr(server, "store_stats", boom)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool("connector_status", {})))
+    assert payload["database"]["ok"] is False
+    assert "does not exist" in payload["database"]["error"]
+    assert "hint" in payload["database"]
+    assert "telegram" in payload

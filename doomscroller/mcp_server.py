@@ -5,7 +5,8 @@ Cursor starts it over stdio on whatever machine the agent runs on. Three familie
 tools, with different requirements:
 
 * **Archive read (PostgreSQL only)** — ``read_messages``, ``new_messages``,
-  ``search_messages``, ``message_events``, ``list_picked_chats``, ``archive_stats``.
+  ``search_messages``, ``message_events``, ``chat_history``, ``list_picked_chats``,
+  ``archive_stats``.
   They need ``DATABASE_URL`` and nothing else: no Telegram credentials, no session, no
   model, no access to this repo.
 * **Scoring read (PostgreSQL only)** — ``post_scores``, ``channel_states``,
@@ -30,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -41,11 +43,15 @@ from . import __version__
 from .db import healthcheck, session_scope
 from .models import ChannelEvent, ChannelState, Message, PostScore, Subscription
 from .store import (
+    all_messages,
+    delete_webhook,
     events_for_message,
     fetch_messages,
+    list_webhooks,
     new_messages as store_new_messages,
     search_messages as store_search,
     stats as store_stats,
+    upsert_webhook,
 )
 from .scoring.state import pending_counts, state_snapshot
 from .subscriptions import get_subscription, list_subscriptions, normalise_ref
@@ -143,17 +149,17 @@ def connector_status() -> str:
 
     Does not connect to Telegram — it reports on configuration and stored state, so it is
     safe and instant to call.
+
+    Always returns a report, even when the database is down: the connection is bounded by
+    ``DB_CONNECT_TIMEOUT`` (default 5 s) and every extra query has its own budget, because
+    an MCP client kills the call at ~30 s with an uninformative "Request timed out".
     """
     report: dict[str, Any] = {"tool_version": __version__}
 
-    try:
-        report["database"] = healthcheck()
-    except Exception as exc:  # noqa: BLE001
-        report["database"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        return _json(report)
-
     data_dir = Path(os.environ.get("DATA_DIR") or ".").expanduser()
     session_name = os.environ.get("TELEGRAM_SESSION", "scroller_session")
+    # Configuration is always reportable — a readiness check whose database is down should
+    # still say whether the rest of the setup looks right.
     report["telegram"] = {
         "api_id_set": bool(os.environ.get("TELEGRAM_API_ID")),
         "api_hash_set": bool(os.environ.get("TELEGRAM_API_HASH")),
@@ -162,6 +168,44 @@ def connector_status() -> str:
         "proxy": "configured" if os.environ.get("TG_PROXY", "").strip() not in ("", "off") else "direct",
     }
 
+    try:
+        report["database"] = healthcheck()
+    except Exception as exc:  # noqa: BLE001
+        report["database"] = _db_failure(exc)
+        return _json(report)
+
+    try:
+        report["subscriptions"], report["counts"], report["scoring"] = _status_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        # The database answered the probe but a query failed (missing tables, a lock, a
+        # timeout): report that instead of dragging the whole call past the client's limit.
+        report["database"] = _db_failure(exc)
+        return _json(report)
+    return _json(report)
+
+
+def _db_failure(exc: BaseException) -> dict:
+    """A structured ``database`` block for a failed connection or query."""
+    detail = str(exc)
+    hint = None
+    if "ConnectionTimeout" in detail or "connection timeout expired" in detail:
+        hint = (
+            "PostgreSQL accepted the TCP connection but never completed the startup "
+            "handshake. Check the container/port mapping (compose maps db to "
+            "127.0.0.1:5434) and that the host can actually reach it."
+        )
+    elif "Connection refused" in detail:
+        hint = "Nothing is listening on that host:port — start the database (docker compose up -d db)."
+    elif "does not exist" in detail and "relation" in detail:
+        hint = "The database is reachable but empty — run the ingest/scorer once to create tables."
+    block: dict[str, Any] = {"ok": False, "error": f"{type(exc).__name__}: {detail}"}
+    if hint:
+        block["hint"] = hint
+    return block
+
+
+def _status_snapshot() -> tuple[dict, dict, dict]:
+    """Subscriptions, row counts and scoring facts — read-only, one session."""
     _ensure_db()
     with session_scope() as session:
         subs = list_subscriptions(session)
@@ -181,19 +225,19 @@ def connector_status() -> str:
                         "last_error": s.last_error,
                     }
                 )
-        report["subscriptions"] = {
+        subscriptions = {
             "total": len(subs),
             "enabled": sum(1 for s in subs if s.enabled),
             "stale_or_failing": stale,
         }
-        report["counts"] = store_stats(session)
+        counts = store_stats(session)
         # Scoring facts come from the database, never from this process's environment: the
         # MCP server is not the scorer and usually runs on a different machine, where
         # SCORER_* is not set (and where the only thing that must be configured is the DB).
         scored = session.exec(select(PostScore).where(PostScore.status == "scored")).all()
         channels = session.exec(select(ChannelState)).all()
         stamps = [row.scored_at for row in scored if row.scored_at is not None]
-        report["scoring"] = {
+        scoring = {
             "channels": len(channels),
             "scored_posts": len(scored),
             "skipped_posts": len(
@@ -209,7 +253,7 @@ def connector_status() -> str:
             ),
             "last_scored_at": max(stamps).isoformat() if stamps else None,
         }
-    return _json(report)
+    return subscriptions, counts, scoring
 
 
 @mcp.tool()
@@ -277,6 +321,72 @@ def message_events(chat: str, message_id: int) -> str:
         })
 
 
+# ── compressed history ────────────────────────────────────────────────────────
+
+# How much of a message counts as "the gist" before it is cut with an ellipsis. A whole
+# channel history is long; the point of the compressed view is that it fits in one context.
+COMPRESS_CHARS_DEFAULT = 280
+_URL_RE = re.compile(r"https?://\S+")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _gist(text: Optional[str], limit: int) -> dict[str, Any]:
+    """One message → its first ``limit`` characters, with the obvious noise removed.
+
+    Dropped: URLs (they are rarely the point and eat the whole budget), zero-width and
+    other control characters, and runs of whitespace. Line breaks are kept as a single
+    space because one row is one message in the output array.
+    """
+    raw = text or ""
+    body = _URL_RE.sub(" ", raw)
+    body = "".join(ch for ch in body if ch.isprintable() or ch in "\n\t")
+    body = _SPACE_RE.sub(" ", body).strip()
+    out: dict[str, Any] = {"t": body[:limit]}
+    if len(body) > limit:
+        out["more"] = True
+    return out
+
+
+@mcp.tool()
+def chat_history(
+    chat: str,
+    limit: int = COMPRESS_CHARS_DEFAULT,
+    after_id: Optional[int] = None,
+    include_deleted: bool = False,
+) -> str:
+    """The whole history of one chat, compressed into one JSON array (oldest first).
+
+    This is the "read it all at once" tool: every stored message becomes one array item
+    that keeps only the main information — message id, date, sender and a truncated gist
+    of the text. No reply ids, edit timestamps, raw payloads or event logs are included;
+    for those use read_messages / message_events.
+
+    Args:
+        chat: subscription reference, e.g. "demo_channel" or "t.me/demo_channel".
+        limit: characters of text kept per message (default 280, 0-4000). 0 keeps no text.
+        after_id: only messages newer than this Telegram message id.
+        include_deleted: also include messages whose Telegram original was deleted.
+    """
+    _ensure_db()
+    limit = max(0, min(int(limit), 4000))
+    with session_scope() as session:
+        chat_id = _chat_id(session, chat)
+        rows = all_messages(
+            session, chat_id, after_id=after_id, include_deleted=include_deleted
+        )
+        return _json(
+            [
+                {
+                    "id": m.message_id,
+                    "date": m.date.isoformat() if m.date else None,
+                    "from": m.sender_name,
+                    **_gist(m.text, limit),
+                }
+                for m in rows
+            ]
+        )
+
+
 _telegram: Any = None
 
 
@@ -284,16 +394,22 @@ async def _telegram_client() -> Any:
     """Lazily open Telegram using the MCP's OWN session file.
 
     A separate session keeps this process from contending with the poller over the same
-    SQLite session file.
+    SQLite session file. The webhook forwarder is attached here, on the same client, so
+    one connection serves both the live tools and delivery.
+
+    Note the lifetime: deliveries happen while this process runs. A stdio MCP client
+    keeps it alive for the session; an HTTP server keeps it alive for its own life.
     """
     global _telegram
     if _telegram is None:
         from .config import load_settings
         from .telegram_client import build_client, ensure_connected
+        from .webhooks import register_forwarder
 
         settings = load_settings()
         client = build_client(settings, settings.mcp_session_path)
         await ensure_connected(client, settings)
+        register_forwarder(client)
         _telegram = client
     return _telegram
 
@@ -339,6 +455,109 @@ def archive_stats() -> str:
     _ensure_db()
     with session_scope() as session:
         return _json(store_stats(session))
+
+
+# ── webhook forwarding: where arriving messages of a chat are POSTed ─────────
+
+def _webhook_row(w: Any) -> dict:
+    return {
+        "chat_id": w.chat_id,
+        "chat": w.chat_ref,
+        "url": w.url,
+        "enabled": w.enabled,
+        "delivered": w.delivered,
+        "failed": w.failed,
+        "last_error": w.last_error,
+        "last_delivered_at": w.last_delivered_at.isoformat() if w.last_delivered_at else None,
+    }
+
+
+def _check_url(url: str) -> str:
+    """Reject obvious mistakes early; this URL is dialled by the webhook forwarder."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"webhook URL must be an absolute http(s) URL, got {url!r}")
+    return url.strip()
+
+
+def _webhook_auth_error() -> Optional[dict]:
+    """Subscribing is gated on WEBHOOK_TOKEN: without it the forwarder is an open SSRF."""
+    from .webhooks import webhook_token
+
+    if not webhook_token():
+        return {
+            "ok": False,
+            "refused": True,
+            "reason": (
+                "WEBHOOK_TOKEN is not set. Forwarding to an arbitrary URL from the Telegram "
+                "account is off by default; set WEBHOOK_TOKEN in .env to enable it."
+            ),
+        }
+    return None
+
+
+@mcp.tool()
+def webhook_subscribe(chat: str, url: str) -> str:
+    """Forward every message arriving in `chat` to `url` as a raw Telethon update.
+
+    Subscribing the same chat again replaces its URL. Requires WEBHOOK_TOKEN (sent to
+    the receiver as the X-Webhook-Token header); without it the call is refused.
+
+    Args:
+        chat: subscription reference, @username, t.me link or numeric id.
+        url: absolute http(s) URL that receives a JSON POST per message.
+    """
+    refused = _webhook_auth_error()
+    if refused:
+        return _json(refused)
+    try:
+        target = _check_url(url)
+    except ValueError as exc:
+        return _json({"ok": False, "subscribed": False, "reason": str(exc)})
+
+    _ensure_db()
+    with session_scope() as session:
+        try:
+            chat_id = _chat_id(session, chat)
+        except ValueError as exc:
+            # A chat that is not in the archive yet can still be watched by its numeric
+            # id; anything else needs the id so deliveries can be matched.
+            return _json({"ok": False, "subscribed": False, "reason": str(exc)})
+        row = upsert_webhook(session, chat_id, target, chat_ref=chat)
+        return _json({"ok": True, "subscribed": True, **_webhook_row(row)})
+
+
+@mcp.tool()
+def webhook_unsubscribe(chat: str) -> str:
+    """Stop forwarding messages of `chat` to its webhook.
+
+    Delivery stops on the next arriving message — the forwarder re-reads the table for
+    every message, so no restart is needed.
+    """
+    _ensure_db()
+    with session_scope() as session:
+        try:
+            chat_id = _chat_id(session, chat)
+        except ValueError as exc:
+            return _json({"ok": False, "subscribed": False, "reason": str(exc)})
+        removed = delete_webhook(session, chat_id)
+        return _json({
+            "ok": True,
+            "subscribed": False,
+            "chat": chat,
+            "chat_id": chat_id,
+            "was_subscribed": removed,
+        })
+
+
+@mcp.tool()
+def webhook_list() -> str:
+    """Every chat currently forwarding to a webhook, with delivery counters and last error."""
+    _ensure_db()
+    with session_scope() as session:
+        return _json([_webhook_row(w) for w in list_webhooks(session)])
 
 
 

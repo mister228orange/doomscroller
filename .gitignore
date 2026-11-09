@@ -35,3 +35,6 @@ Thumbs.db
 
 # generated rating pages
 reports/
+
+# Local database dumps (pg_dump output, can be large)
+backup/

@@ -7,11 +7,20 @@ back **any amount** of stored history — or just what's new since last time.
 subscribe  →  poll/watch  →  PostgreSQL  →  fetch | new | search
                                    ↓
                             score  →  post_scores + channel_states  →  scores | channels
+                                   ↓
+                              mcp  →  agents (tools: read, scores, webhooks)
 ```
 
 The archiver stores what a channel said. The **scoring agent** (`score`) reads that archive
 on a schedule and grades every post against a six-axis rubric, one post at a time, keeping a
-per-channel trajectory — see [Scoring agent](#scoring-agent-score).
+per-channel trajectory — see [Scoring agent](#scoring-agent-score). The **MCP server**
+publishes the archive, the scores and a webhook forwarder to agents.
+
+> **Current state (2026-11-09):** tests are green (`247 passed`); the MCP surface gained
+> `chat_history` (whole history, compressed into one array) and webhook forwarding
+> (`webhook_subscribe` / `_unsubscribe` / `_list`); `connector_status` now always answers
+> within ~5 s instead of hanging past a client's 30 s timeout. Open items and the plan are in
+> [State and roadmap](#state-and-roadmap).
 
 ## Topology
 
@@ -165,13 +174,69 @@ get right when wiring a new client:
 
 | Tools | Needs | Notes |
 |---|---|---|
-| `read_messages`, `new_messages`, `search_messages`, `message_events`, `list_picked_chats`, `archive_stats` | `DATABASE_URL` | reads `messages` / `message_events`, so any writer is queryable |
+| `read_messages`, `new_messages`, `search_messages`, `message_events`, `chat_history`, `list_picked_chats`, `archive_stats` | `DATABASE_URL` | reads `messages` / `message_events`, so any writer is queryable |
 | `post_scores`, `channel_states`, `channel_events`, `connector_status` | `DATABASE_URL` | the scorer writes those rows; MCP only reads them, and reports the models + prompt versions actually recorded in the database |
 | `list_chats`, `send_message` | `DATABASE_URL` + Telegram credentials + a session | client opened lazily, on first use only |
+| `webhook_subscribe`, `webhook_unsubscribe`, `webhook_list` | `DATABASE_URL` + `WEBHOOK_TOKEN` (for subscribe/unsubscribe) | stores a per-chat URL; the forwarder is attached to the live session |
 
 A client that only wants the archive and the scores needs **no Telegram configuration at
 all**. `send_message` acts as the real user account, so it is denied by default: a chat must
 be listed in `SEND_ALLOWLIST` (or `*`), and sends are rate-limited by `SEND_RATE_PER_MIN`.
+
+### Reading a whole history at once: `chat_history`
+
+`read_messages` pages, `chat_history` does not — it returns the **entire** stored history of
+one chat as a single flat JSON **array**, oldest first, with only the main information per
+message:
+
+```json
+[{"id": 3, "date": "2024-02-19T22:38:49+00:00", "from": "Slowpoke Investments",
+  "t": "Путь слоупока к финансовому благополучию начинается с…", "more": true}]
+```
+
+- `id` — Telegram message id; `date` — ISO timestamp; `from` — sender name; `t` — gist.
+- Dropped as noise: reply ids, edit timestamps, deleted flags, raw payloads, the event log
+  (use `message_events` for those), URLs, control/zero-width characters and repeated
+  whitespace.
+- `t` is capped at `limit` characters (default 280, `0` = metadata only, max 4000);
+  `"more": true` marks a message whose text was cut.
+- `after_id` and `include_deleted` narrow the window, same as `read_messages`.
+
+On a real 467-message channel this is ~486 KB via `read_messages` versus ~159 KB via
+`chat_history` at 280 chars (and ~60 KB with `limit: 0`), so a full history fits in one
+context window. When you only need a page, use `read_messages` instead.
+
+### Forwarding arriving messages to a webhook
+
+Three tools, one per chat:
+
+| Tool | What it does |
+|---|---|
+| `webhook_subscribe(chat, url)` | every message arriving in `chat` is POSTed to `url`; subscribing again replaces the URL |
+| `webhook_unsubscribe(chat)` | stops delivery (takes effect on the next message — the table is re-read, no restart) |
+| `webhook_list()` | every subscription with delivery counters and the last error |
+
+The body is the **raw Telethon update** — nothing is thrown away, because the receiver is
+usually an agent that may want any field:
+
+```json
+{"chat_id": -1009990001111, "message_id": 42,
+ "raw": {"id": 42, "message": "привет", "from_id": {"user_id": 7}}}
+```
+
+Delivery needs both halves:
+
+- **`WEBHOOK_TOKEN` in `.env`** — sent as the `X-Webhook-Token` header. Without it
+  `webhook_subscribe` is *refused*: pointing the account at an arbitrary URL is a standing
+  SSRF, so it is off by default like sending is.
+- **a live session in the MCP process** — the forwarder attaches to the MCP's own
+  Telethon client when the first live tool is used. Deliveries therefore happen while that
+  process runs; `python -m doomscroller mcp --transport streamable-http` is the mode for a
+  long-lived forwarder.
+
+A dead endpoint does not unsubscribe anything: the attempt is counted, `last_error` is
+recorded, and `webhook_list` shows it.
+
 
 Two environment traps, both learned the hard way:
 
@@ -179,10 +244,51 @@ Two environment traps, both learned the hard way:
    `...@db:5432/doomscroller`, which only resolves inside the compose network. An agent
    running on the host must receive `...@127.0.0.1:5434/doomscroller` explicitly — the
    server reads `.env` with `override=False`, so an explicit variable wins.
+   **Unless the published port is broken on your machine** — see the next note.
 2. **One live session per process.** `list_chats` and `send_message` open their own session
    file (`TELEGRAM_MCP_SESSION`, default `<session>_mcp`) so they never contend with the
    poller. If several MCP processes may use the live tools at once, give each one a distinct
    `TELEGRAM_MCP_SESSION` — two processes sharing one SQLite session file is a locking race.
+
+### When the published port does not work: run the MCP inside compose
+
+A published port can accept TCP and still deliver nothing: the host connects, sends its
+startup packet, and no byte ever comes back, so every tool call dies on the client's
+timeout. This is a docker-proxy/netfilter failure, not a doomscroller bug — check it with
+
+```bash
+docker compose exec -T db pg_isready -h 127.0.0.1 -p 5432   # healthy inside
+nc -z -w 3 127.0.0.1 5434 && echo port-open                  # port-open from the host
+```
+
+If *every* published port behaves that way (not just this one), skip the host entirely and
+run the MCP server inside the compose network. `db:5432` keeps working, and the client only
+needs `/usr/bin/docker`:
+
+```yaml
+- id: mcp-doomscroller
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: doomscroller
+    transport: stdio
+    command: /usr/bin/docker
+    args: ['compose', 'run', '--rm', '--no-deps', '-T',
+           '-e', 'DATABASE_URL=postgresql+psycopg://doomscroller:doomscroller@db:5432/doomscroller',
+           'doomscroller', 'python', '-m', 'doomscroller', 'mcp', '--transport', 'stdio']
+    cwd: <repo>
+    failOnStartupError: false
+    toolCallTimeoutMs: 30000
+```
+
+This runs the same image as the poller, so the MCP cannot drift from the service version.
+Two consequences: each tool call pays container startup (~5 s for the first one), and
+`connector_status` reports `session_present: false` unless `TELEGRAM_SESSION`/`DATA_DIR` are
+passed too — the repo is mounted at `/app`, so the live session is
+`TELEGRAM_SESSION=scroller_session DATA_DIR=/app`.
+
+Either way, the database connection is bounded by `DB_CONNECT_TIMEOUT` (default 5 s), so a
+dead database surfaces as a report with a `hint`, not as a client-side timeout.
+
 
 ### Where each client keeps its config
 
@@ -681,6 +787,8 @@ The MCP surface gains `list_chats` and `send_message` alongside the read-only ar
 | `post_scores` | one rubric row per post (`scored` / `skipped` / `failed`) with the six axes, KPD/Eff, classification, deviations and the prompt version |
 | `channel_states` | derived trajectory per channel: moving means, tag distribution, last 5 local anchors, summary, counters |
 | `channel_events` | **append-only** trajectory log: `shift` / `peak` / `summary` |
+| `media_ocr` | OCR text of image posts, joined by `(chat_id, message_id)` |
+| `chat_webhooks` | one row per chat: where to POST arriving messages, plus delivery counters and the last error |
 
 ## The cursor guarantee
 
@@ -695,6 +803,53 @@ re-processing is harmless.
 This is a deliberate fix. The earlier implementation advanced `last_msg_id` *before* calling
 the model, so a timeout silently dropped those messages forever. There is a test pinning the
 behaviour: `tests/test_ingest_cursor.py::test_cursor_does_not_advance_when_storage_fails`.
+
+## State and roadmap
+
+### Where this stands right now (2026-11-09)
+
+Verified on this machine: `247 passed` (`python -m pytest tests/ -q`), running against
+PostgreSQL when it is reachable and falling back to SQLite when it is not.
+
+Working and covered by tests:
+
+| Area | State |
+|---|---|
+| Ingest, cursor, edits/deletes, search | stable; the cursor guarantee below is pinned by a test |
+| Scoring agent, rubric, calibration, OCR | stable; `SCORER_*` knobs documented above |
+| MCP read surface | `read_messages` / `new_messages` / `search_messages` / `message_events` / `chat_history` / `archive_stats` |
+| MCP scoring surface | `post_scores` / `channel_states` / `channel_events` |
+| MCP live Telegram | `list_chats` / `send_message` (sending denied by default) |
+| Webhook forwarding | `webhook_subscribe` / `webhook_unsubscribe` / `webhook_list`; raw Telethon update, `X-Webhook-Token` |
+| `connector_status` | bounded by `DB_CONNECT_TIMEOUT` (5 s); returns a report with a `hint` when the database is down |
+
+Known limits, not bugs to be surprised by:
+
+- **A broken published port is not a doomscroller problem.** On the current host every
+  docker-published port accepts TCP but delivers no data, so clients must run the MCP inside
+  the compose network — see [the port note](#when-the-published-port-does-not-work-run-the-mcp-inside-compose).
+  This needs a reboot of the host to clear; the workaround is documented and in use.
+- **The webhook forwarder lives as long as its MCP process.** Under stdio that is one
+  client session; a permanent forwarder needs `--transport streamable-http`.
+- **Real §-per-post cost.** NanoGPT holds a per-request deposit sized from
+  `SCORER_MAX_TOKENS`; keep `SCORER_MAX_TOKENS=2000` on a small balance (see `AGENTS.md`).
+
+### Next
+
+Ordered by what unblocks an agent doing real work:
+
+1. **A long-lived forwarder service.** Run the MCP as a plain compose service
+   (`--transport streamable-http`), so webhook delivery and live tools do not depend on an
+   editor's process being open.
+2. **`chat_history` on the CLI.** The compressed view exists only over MCP today; `fetch --all`
+   still prints one line per message.
+3. **Delivery retries.** A failed webhook POST is counted and reported, never retried. A
+   small backoff queue (attempt N after N seconds, capped) would make a briefly-down receiver
+   survivable.
+4. **Webhook payload selection.** Always sending the raw update is a deliberate default;
+   a `mode=normalized` option would keep receivers that only want `chat_id/text` cheap.
+5. **Score freshness in `connector_status`.** It reports what is scored, not what is *stale*;
+   a per-channel "last scored N minutes ago" line would make coverage visible at a glance.
 
 ## Proxy
 

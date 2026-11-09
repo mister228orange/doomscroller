@@ -7,9 +7,35 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
 from sqlmodel import Session, SQLModel, create_engine
 
 _engine = None
+
+# Seconds to wait for a TCP connection to PostgreSQL. Without this, libpq waits forever
+# when the database is unreachable but its port accepts SYNs (a blackholed docker-proxy,
+# a suspended container, a firewall that drops rather than rejects). An MCP client gives
+# a tool call ~30 s and then reports a bare "Request timed out", so the tool must fail
+# fast and explain itself instead of hanging the agent.
+DEFAULT_CONNECT_TIMEOUT = 5
+
+
+def _connect_args(url: str) -> dict:
+    """Per-dialect connect arguments, chiefly a bounded connect timeout."""
+    if url.startswith("sqlite"):
+        return {}
+    try:
+        query = make_url(url).query
+    except Exception:  # noqa: BLE001 — a malformed URL is reported by create_engine
+        query = {}
+    if "connect_timeout" in query:
+        return {}
+    timeout = os.environ.get("DB_CONNECT_TIMEOUT", "").strip()
+    try:
+        seconds = int(timeout) if timeout else DEFAULT_CONNECT_TIMEOUT
+    except ValueError:
+        seconds = DEFAULT_CONNECT_TIMEOUT
+    return {"connect_timeout": max(1, seconds)}
 
 
 def database_url() -> str:
@@ -25,9 +51,17 @@ def database_url() -> str:
 def get_engine(url: str | None = None):
     global _engine
     if url is not None:
-        return create_engine(url, pool_pre_ping=True, future=True)
+        return create_engine(
+            url, pool_pre_ping=True, future=True, connect_args=_connect_args(url)
+        )
     if _engine is None:
-        _engine = create_engine(database_url(), pool_pre_ping=True, future=True)
+        resolved = database_url()
+        _engine = create_engine(
+            resolved,
+            pool_pre_ping=True,
+            future=True,
+            connect_args=_connect_args(resolved),
+        )
     return _engine
 
 

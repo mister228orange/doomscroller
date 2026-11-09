@@ -17,7 +17,14 @@ from typing import Any, Iterator, Optional, Sequence
 from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
-from .models import DetectedEvent, Message, MessageEvent, Subscription, utcnow
+from .models import (
+    ChatWebhook,
+    DetectedEvent,
+    Message,
+    MessageEvent,
+    Subscription,
+    utcnow,
+)
 
 VALID_EVENT_TYPES = {"new", "edited", "deleted"}
 
@@ -209,6 +216,25 @@ def search_messages(
     return list(session.exec(stmt.order_by(Message.message_id.desc()).limit(limit)).all())
 
 
+def all_messages(
+    session: Session,
+    chat_id: int,
+    *,
+    after_id: Optional[int] = None,
+    include_deleted: bool = False,
+) -> list[Message]:
+    """The entire stored history of one chat, oldest first.
+
+    Materialised on purpose: the caller compresses it into a small payload anyway, and
+    reading it in one query keeps the message order exactly as Telegram delivered it.
+    """
+    return list(
+        iter_all_messages(
+            session, chat_id, after_id=after_id, include_deleted=include_deleted
+        )
+    )
+
+
 def events_for_message(session: Session, chat_id: int, message_id: int) -> list[MessageEvent]:
     return list(
         session.exec(
@@ -239,3 +265,65 @@ def stats(session: Session, chat_id: Optional[int] = None) -> dict:
     if chat_id is not None:
         out["messages_in_chat"] = count(Message, Message.chat_id == chat_id)
     return out
+
+
+# ── chat webhooks ─────────────────────────────────────────────────────────────
+
+def get_webhook(session: Session, chat_id: int) -> Optional[ChatWebhook]:
+    return session.exec(select(ChatWebhook).where(ChatWebhook.chat_id == chat_id)).first()
+
+
+def list_webhooks(session: Session, *, enabled_only: bool = False) -> list[ChatWebhook]:
+    stmt = select(ChatWebhook).order_by(ChatWebhook.chat_id.asc())
+    if enabled_only:
+        stmt = stmt.where(ChatWebhook.enabled == True)  # noqa: E712
+    return list(session.exec(stmt).all())
+
+
+def upsert_webhook(
+    session: Session, chat_id: int, url: str, *, chat_ref: Optional[str] = None
+) -> ChatWebhook:
+    """Subscribe a chat, or replace its URL. Idempotent for the same input."""
+    row = get_webhook(session, chat_id)
+    if row is None:
+        row = ChatWebhook(chat_id=chat_id, url=url, chat_ref=chat_ref)
+        session.add(row)
+    else:
+        row.url = url
+        row.enabled = True
+        row.last_error = None
+        if chat_ref:
+            row.chat_ref = chat_ref
+        row.updated_at = utcnow()
+    session.flush()
+    return row
+
+
+def delete_webhook(session: Session, chat_id: int) -> bool:
+    """Unsubscribe a chat. Returns False when there was nothing to remove."""
+    row = get_webhook(session, chat_id)
+    if row is None:
+        return False
+    session.delete(row)
+    session.flush()
+    return True
+
+
+def record_delivery(session: Session, chat_id: int, *, error: Optional[str] = None) -> None:
+    """Count one delivery attempt: success clears the error, failure stores it.
+
+    A dead endpoint stays subscribed — the error is reported by ``webhook_list`` so the
+    operator can see it, rather than silently dropping the chat.
+    """
+    row = get_webhook(session, chat_id)
+    if row is None:
+        return
+    if error is None:
+        row.delivered = (row.delivered or 0) + 1
+        row.last_error = None
+        row.last_delivered_at = utcnow()
+    else:
+        row.failed = (row.failed or 0) + 1
+        row.last_error = error[:500]
+    row.updated_at = utcnow()
+    session.flush()
