@@ -806,10 +806,32 @@ behaviour: `tests/test_ingest_cursor.py::test_cursor_does_not_advance_when_stora
 
 ## State and roadmap
 
-### Where this stands right now (2026-11-09)
+### Where this stands right now (2026-11-11)
 
-Verified on this machine: `247 passed` (`python -m pytest tests/ -q`), running against
-PostgreSQL when it is reachable and falling back to SQLite when it is not.
+Checked against the live database over MCP (`connector_status`, `channel_states`,
+`list_picked_chats`); the test suite still reports `247 passed`.
+
+**Everything is built; nothing is currently running.** Only the `db` container is up —
+`doomscroller` (poller) and `scorer` are stopped, so no message has been ingested since
+**2026-11-08 02:38 UTC** and nothing has been scored since **2026-11-08 17:21 UTC**.
+`connector_status` flags all five subscriptions as stale with `last_error: null`: nothing is
+failing, the pipeline is simply not running. The numbers below are a snapshot of 2026-11-08,
+not the channels as they are today.
+
+Archive and scoring coverage at that point:
+
+| Channel | Messages | Scored | Skipped | Never scored | Mean KPD |
+|---|---:|---:|---:|---:|---:|
+| `slowpoke_investments` | 467 | 88 | 13 | **366** | 4.06 |
+| `bukvy_znaesh` | 157 | 28 | 3 | **126** | 6.37 |
+| `design4TOR` | 94 | 72 | 13 | 9 | 6.46 |
+| `demo_channel` | 17 | 3 | 14 | 0 | 7.82 |
+| **Total** | **735** | **191** | **43** | **501** | |
+
+Two caveats on reading those means: the rows were produced by two models and two prompt
+versions (`deepseek/deepseek-v4-pro` + `c163f83fad1d`, and older `qwen3:4b` +
+`a463b3fa2d97`), so a channel's average mixes both; and `slowpoke_investments` is 78 % ungraded,
+so its mean describes the graded tail, not the channel.
 
 Working and covered by tests:
 
@@ -836,19 +858,25 @@ Known limits, not bugs to be surprised by:
 
 ### Next
 
-Ordered by what unblocks an agent doing real work:
+Deferred by the owner on 2026-11-11 as non-urgent — do not start these on a fresh session
+without being asked:
 
-1. **A long-lived forwarder service.** Run the MCP as a plain compose service
+1. **Restart the pipeline** (`docker compose up -d doomscroller scorer`). Nothing else below
+   can be judged until the 501-post backlog is working through; at `SCORER_SAMPLE_EVERY=5`
+   decide first whether the tail is sampled or caught up in full.
+2. **Homogenise the scores.** Two models and two prompt versions are mixed in `post_scores`;
+   a re-scoring pass (or a `--since` reset) would make channel means comparable.
+3. **A long-lived forwarder service.** Run the MCP as a plain compose service
    (`--transport streamable-http`), so webhook delivery and live tools do not depend on an
    editor's process being open.
-2. **`chat_history` on the CLI.** The compressed view exists only over MCP today; `fetch --all`
+4. **`chat_history` on the CLI.** The compressed view exists only over MCP today; `fetch --all`
    still prints one line per message.
-3. **Delivery retries.** A failed webhook POST is counted and reported, never retried. A
+5. **Delivery retries.** A failed webhook POST is counted and reported, never retried. A
    small backoff queue (attempt N after N seconds, capped) would make a briefly-down receiver
    survivable.
-4. **Webhook payload selection.** Always sending the raw update is a deliberate default;
+6. **Webhook payload selection.** Always sending the raw update is a deliberate default;
    a `mode=normalized` option would keep receivers that only want `chat_id/text` cheap.
-5. **Score freshness in `connector_status`.** It reports what is scored, not what is *stale*;
+7. **Score freshness in `connector_status`.** It reports what is scored, not what is *stale*;
    a per-channel "last scored N minutes ago" line would make coverage visible at a glance.
 
 ## Proxy
