@@ -403,13 +403,22 @@ async def _telegram_client() -> Any:
     global _telegram
     if _telegram is None:
         from .config import load_settings
-        from .telegram_client import build_client, ensure_connected
+        from .telegram_client import build_client
         from .webhooks import register_forwarder
 
         settings = load_settings()
         client = build_client(settings, settings.mcp_session_path)
-        await ensure_connected(client, settings)
-        register_forwarder(client)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError(
+                    "Telegram MCP session is not authorized. Run locally: "
+                    ".venv/bin/python scripts/telegram_login.py --mcp"
+                )
+            register_forwarder(client)
+        except BaseException:
+            await client.disconnect()
+            raise
         _telegram = client
     return _telegram
 
@@ -429,6 +438,15 @@ async def list_chats(limit: int = 200) -> str:
 
 
 @mcp.tool()
+async def read_live_messages(chat: str, limit: int = 50) -> str:
+    """Read recent messages directly from Telegram, without PostgreSQL or a subscription."""
+    from .telegram_ops import fetch_history
+
+    client = await _telegram_client()
+    return _json(await fetch_history(client, chat, limit=max(1, min(int(limit), 1000))))
+
+
+@mcp.tool()
 async def send_message(chat: str, text: str) -> str:
     """Send a text message to a chat. REFUSED unless the chat is in SEND_ALLOWLIST.
 
@@ -436,10 +454,11 @@ async def send_message(chat: str, text: str) -> str:
     rate-limited. `chat` accepts @username, a t.me link, a numeric id, or a title.
     """
     from .config import load_settings
-    from .telegram_ops import SendNotAllowed, send_text
+    from .telegram_ops import SendNotAllowed, assert_send_allowed, send_text
 
     settings = load_settings()
     try:
+        assert_send_allowed(settings, chat)
         client = await _telegram_client()
         result = await send_text(client, settings, chat, text)
     except SendNotAllowed as exc:

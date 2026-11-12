@@ -33,6 +33,7 @@ EXPECTED_TOOLS = {
     "chat_history",
     "archive_stats",
     "list_chats",
+    "read_live_messages",
     "send_message",
     "post_scores",
     "channel_states",
@@ -298,6 +299,108 @@ async def test_connector_status_reports_scoring_readiness(session):
         payload = json.loads(_text(await client.call_tool("connector_status", {})))
     assert payload["scoring"]["scored_posts"] == 2
     assert payload["scoring"]["channels"] == 1
+
+
+async def test_live_read_uses_telegram_without_database(monkeypatch):
+    from doomscroller import mcp_server, telegram_ops
+    marker = object()
+
+    async def connected():
+        return marker
+
+    async def history(client, chat, limit):
+        assert client is marker
+        return {"chat": chat, "limit": limit, "messages": []}
+
+    monkeypatch.setattr(mcp_server, "_telegram_client", connected)
+    monkeypatch.setattr(telegram_ops, "fetch_history", history)
+    async with Client(mcp) as client:
+        payload = json.loads(_text(await client.call_tool(
+            "read_live_messages", {"chat": "test", "limit": 5000}
+        )))
+    assert payload == {"chat": "test", "limit": 1000, "messages": []}
+
+
+async def test_unauthorized_mcp_disconnects_without_login(monkeypatch):
+    from doomscroller import mcp_server, telegram_client, config
+
+    class Unauthorized:
+        disconnected = False
+
+        async def connect(self):
+            pass
+
+        async def is_user_authorized(self):
+            return False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    fake = Unauthorized()
+    monkeypatch.setattr(mcp_server, "_telegram", None)
+    monkeypatch.setattr(config, "load_settings", lambda: config.Settings(api_id=1, api_hash="test"))
+    monkeypatch.setattr(telegram_client, "build_client", lambda *args: fake)
+    with pytest.raises(RuntimeError, match="telegram_login.py --mcp"):
+        await mcp_server._telegram_client()
+    assert fake.disconnected
+    assert mcp_server._telegram is None
+
+
+async def test_refused_send_never_connects_to_telegram(monkeypatch):
+    from unittest.mock import AsyncMock
+    from doomscroller import mcp_server, config
+
+    connect = AsyncMock(side_effect=AssertionError("must not connect"))
+    monkeypatch.setattr(mcp_server, "_telegram_client", connect)
+    monkeypatch.setattr(config, "load_settings", lambda: config.Settings(api_id=1, api_hash="test"))
+    async with Client(mcp) as client:
+        result = await client.call_tool("send_message", {"chat": "test", "text": "hello"})
+    payload = json.loads(_text(result))
+    assert payload["refused"] is True
+    assert payload["sent"] is False
+    connect.assert_not_awaited()
+
+
+async def test_authorized_mcp_registers_forwarder_once(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    from doomscroller import mcp_server, telegram_client, config, webhooks
+
+    fake = Mock()
+    fake.connect = AsyncMock()
+    fake.is_user_authorized = AsyncMock(return_value=True)
+    fake.disconnect = AsyncMock()
+    forwarder = Mock()
+    monkeypatch.setattr(mcp_server, "_telegram", None)
+    monkeypatch.setattr(config, "load_settings", lambda: config.Settings(api_id=1, api_hash="test"))
+    build = Mock(return_value=fake)
+    monkeypatch.setattr(telegram_client, "build_client", build)
+    monkeypatch.setattr(webhooks, "register_forwarder", forwarder)
+
+    assert await mcp_server._telegram_client() is fake
+    assert await mcp_server._telegram_client() is fake
+    fake.connect.assert_awaited_once()
+    forwarder.assert_called_once_with(fake)
+    assert build.call_args.args[1] == config.load_settings().mcp_session_path
+    fake.disconnect.assert_not_awaited()
+
+
+async def test_mcp_forwarder_failure_disconnects_client(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    from doomscroller import mcp_server, telegram_client, config, webhooks
+
+    fake = Mock()
+    fake.connect = AsyncMock()
+    fake.is_user_authorized = AsyncMock(return_value=True)
+    fake.disconnect = AsyncMock()
+    monkeypatch.setattr(mcp_server, "_telegram", None)
+    monkeypatch.setattr(config, "load_settings", lambda: config.Settings(api_id=1, api_hash="test"))
+    monkeypatch.setattr(telegram_client, "build_client", lambda *args: fake)
+    monkeypatch.setattr(webhooks, "register_forwarder", Mock(side_effect=RuntimeError("handler failed")))
+
+    with pytest.raises(RuntimeError, match="handler failed"):
+        await mcp_server._telegram_client()
+    fake.disconnect.assert_awaited_once()
+    assert mcp_server._telegram is None
 
 
 # ── connector_status must answer, never hang ────────────────────────────────

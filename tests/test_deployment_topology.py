@@ -157,7 +157,8 @@ def test_scorer_container_does_not_mount_the_session_file():
 def test_scorer_container_gets_its_own_configuration():
     block = _service_block("scorer")
     assert "DATABASE_URL:" in block
-    for knob in ("SCORER_BASE_URL", "SCORER_MODEL", "SCORER_INTERVAL"):
+    for knob in ("SCORER_BASE_URL", "SCORER_MODEL", "SCORER_INTERVAL",
+                 "SCORER_SAMPLE_EVERY", "SCORER_REASONING_EFFORT"):
         assert knob in block, f"scorer is missing {knob}"
 
 
