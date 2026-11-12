@@ -151,8 +151,8 @@ python -m doomscroller login        # asks for the code from Telegram right ther
 
 One command: it sends the code, asks for it, and handles the two-factor password prompt.
 Without a terminal (scripts) it falls back to printing `phone_code_hash` for a second call
-with `--code` and `--hash`. The same flow works for the MCP session by pointing
-`TELEGRAM_MCP_SESSION` at a fresh file.
+with `--code` and `--hash`. To authorize the separate MCP session, run
+`.venv/bin/python scripts/telegram_login.py --mcp` in a private terminal.
 
 The session file lives at `$DATA_DIR/$TELEGRAM_SESSION.session`. Compose mounts the repo at
 `/app` with `DATA_DIR=/app`, so an existing `scroller_session.session` at the repo root is
@@ -176,7 +176,7 @@ get right when wiring a new client:
 |---|---|---|
 | `read_messages`, `new_messages`, `search_messages`, `message_events`, `chat_history`, `list_picked_chats`, `archive_stats` | `DATABASE_URL` | reads `messages` / `message_events`, so any writer is queryable |
 | `post_scores`, `channel_states`, `channel_events`, `connector_status` | `DATABASE_URL` | the scorer writes those rows; MCP only reads them, and reports the models + prompt versions actually recorded in the database |
-| `list_chats`, `send_message` | `DATABASE_URL` + Telegram credentials + a session | client opened lazily, on first use only |
+| `list_chats`, `read_live_messages`, `send_message` | Telegram credentials + an authorized MCP session | client opened lazily; `read_live_messages` reads 1–1000 recent messages directly from Telegram |
 | `webhook_subscribe`, `webhook_unsubscribe`, `webhook_list` | `DATABASE_URL` + `WEBHOOK_TOKEN` (for subscribe/unsubscribe) | stores a per-chat URL; the forwarder is attached to the live session |
 
 A client that only wants the archive and the scores needs **no Telegram configuration at
