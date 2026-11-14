@@ -1,5 +1,16 @@
 # doomscroller
 
+[![CI](https://github.com/mister228orange/doomscroller/actions/workflows/ci.yml/badge.svg)](https://github.com/mister228orange/doomscroller/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-server-purple.svg)](https://modelcontextprotocol.io/)
+
+**Open source (MIT).** Telegram channel archiver + MCP server that gives agents
+structured, queryable access to everything you follow — plus optional LLM scoring
+of posts against a rubric you control.
+
+## What it is
+
 Subscribe to Telegram **channels or chats**, archive **every event** in PostgreSQL, and read
 back **any amount** of stored history — or just what's new since last time.
 
@@ -925,3 +936,11 @@ It writes per-chat state to `doom_states/*.json`. The new archiver supersedes it
 ## License
 
 MIT
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
