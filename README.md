@@ -9,6 +9,9 @@
 structured, queryable access to everything you follow — plus optional LLM scoring
 of posts against a rubric you control.
 
+> **Deeper documentation:** [`docs/`](docs/) — architecture, data model, full CLI and MCP
+> references, the scoring pipeline and development notes.
+
 ## What it is
 
 Subscribe to Telegram **channels or chats**, archive **every event** in PostgreSQL, and read
